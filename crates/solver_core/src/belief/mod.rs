@@ -1,4 +1,8 @@
 //! Hidden-information transitions, reveal handling, and world sampling surfaces.
+//!
+//! Belief logic must preserve the exact uniform posterior over assignments of
+//! unseen cards to face-down tableau slots. The stock/waste cycle is fully known,
+//! and this module should not grow unjustified weighted-posterior machinery.
 
 use serde::{Deserialize, Serialize};
 

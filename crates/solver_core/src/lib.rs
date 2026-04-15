@@ -24,9 +24,17 @@ pub mod stock;
 pub mod types;
 
 pub use cards::{Card, Color, Rank, Suit};
+pub use closure::{
+    ClosureConfig, ClosureEngine, ClosureReason, ClosureResult, ClosureStep, ClosureStopReason,
+    ClosureTranscript,
+};
 pub use config::{
     BeliefPlannerConfig, DeterministicSolverConfig, ExperimentConfig, LateExactConfig,
     SearchConfig, SolverConfig,
+};
+pub use core::{
+    BeliefState, FoundationState, FullState, HiddenAssignment, HiddenAssignments, HiddenSlot,
+    TableauColumn, UnseenCardSet, VisibleState,
 };
 pub use error::{SolverError, SolverResult};
 pub use types::{

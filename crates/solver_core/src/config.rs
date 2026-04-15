@@ -2,11 +2,15 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::closure::ClosureConfig;
+
 /// Top-level configuration object passed into future recommendation calls.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SolverConfig {
     /// Generic budget and execution controls shared by solver layers.
     pub search: SearchConfig,
+    /// Controls for deterministic closure and corridor compression.
+    pub closure: ClosureConfig,
     /// Controls for the deterministic perfect-information solver.
     pub deterministic: DeterministicSolverConfig,
     /// Controls for the hidden-information belief planner.
@@ -21,6 +25,7 @@ impl Default for SolverConfig {
     fn default() -> Self {
         Self {
             search: SearchConfig::default(),
+            closure: ClosureConfig::default(),
             deterministic: DeterministicSolverConfig::default(),
             belief_planner: BeliefPlannerConfig::default(),
             late_exact: LateExactConfig::default(),

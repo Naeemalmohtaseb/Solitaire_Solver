@@ -1,5 +1,7 @@
 //! Small shared types and result surfaces used across solver modules.
 
+use std::fmt;
+
 use serde::{Deserialize, Serialize};
 
 use crate::error::{SolverError, SolverResult};
@@ -41,6 +43,12 @@ impl ColumnId {
     }
 }
 
+impl fmt::Display for ColumnId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "C{}", self.0)
+    }
+}
+
 /// Foundation id in the range 0..=3.
 #[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct FoundationId(u8);
@@ -58,6 +66,12 @@ impl FoundationId {
     /// Returns the zero-based foundation index.
     pub const fn index(self) -> u8 {
         self.0
+    }
+}
+
+impl fmt::Display for FoundationId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "F{}", self.0)
     }
 }
 
