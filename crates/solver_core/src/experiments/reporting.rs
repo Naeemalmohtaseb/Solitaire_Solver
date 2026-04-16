@@ -35,6 +35,16 @@ pub struct BenchmarkSummaryReport {
     pub avg_deterministic_nodes: f64,
     /// Mean sampled worlds per root decision.
     pub avg_root_visits_or_samples: f64,
+    /// Leaf evaluation mode configured for deterministic continuations.
+    pub leaf_eval_mode: String,
+    /// V-Net model path or artifact id, if configured.
+    pub vnet_model_path: Option<String>,
+    /// Total V-Net inference calls.
+    pub vnet_inferences: u64,
+    /// Total V-Net fallback count.
+    pub vnet_fallbacks: u64,
+    /// Total V-Net inference time in microseconds.
+    pub vnet_inference_elapsed_us: u64,
 }
 
 /// Machine-friendly full-game autoplay benchmark summary report.
@@ -66,8 +76,24 @@ pub struct AutoplayBenchmarkSummaryReport {
     pub avg_deterministic_nodes: f64,
     /// Average root visits/samples per game.
     pub avg_root_visits_or_samples: f64,
+    /// Total planner decisions that used root-parallel workers.
+    pub root_parallel_step_count: usize,
+    /// Average root-parallel worker count per game.
+    pub avg_root_parallel_workers: f64,
+    /// Average root-parallel worker simulations per game.
+    pub avg_root_parallel_simulations: f64,
     /// Total late-exact triggers.
     pub late_exact_trigger_count: usize,
+    /// Leaf evaluation mode configured for deterministic continuations.
+    pub leaf_eval_mode: String,
+    /// V-Net model path or artifact id, if configured.
+    pub vnet_model_path: Option<String>,
+    /// Total V-Net inference calls.
+    pub vnet_inferences: u64,
+    /// Total V-Net fallback count.
+    pub vnet_fallbacks: u64,
+    /// Total V-Net inference time in microseconds.
+    pub vnet_inference_elapsed_us: u64,
     /// Termination reason counts.
     pub termination_counts: Vec<AutoplayTerminationCount>,
 }
@@ -105,6 +131,22 @@ pub struct AutoplayComparisonSummaryReport {
     pub ci_lower: f64,
     /// Upper CI-like bound.
     pub ci_upper: f64,
+    /// Baseline leaf evaluation mode.
+    pub baseline_leaf_eval_mode: String,
+    /// Candidate leaf evaluation mode.
+    pub candidate_leaf_eval_mode: String,
+    /// Baseline V-Net model path, if configured.
+    pub baseline_vnet_model_path: Option<String>,
+    /// Candidate V-Net model path, if configured.
+    pub candidate_vnet_model_path: Option<String>,
+    /// Baseline V-Net inference calls.
+    pub baseline_vnet_inferences: u64,
+    /// Candidate V-Net inference calls.
+    pub candidate_vnet_inferences: u64,
+    /// Baseline V-Net fallback count.
+    pub baseline_vnet_fallbacks: u64,
+    /// Candidate V-Net fallback count.
+    pub candidate_vnet_fallbacks: u64,
 }
 
 impl BenchmarkResult {
@@ -122,6 +164,11 @@ impl BenchmarkResult {
             avg_planner_time_per_move_ms: self.mean_time_ms,
             avg_deterministic_nodes: self.mean_nodes,
             avg_root_visits_or_samples: self.mean_samples,
+            leaf_eval_mode: format!("{:?}", self.leaf_eval_mode),
+            vnet_model_path: self.vnet_model_path.clone(),
+            vnet_inferences: self.vnet_inferences,
+            vnet_fallbacks: self.vnet_fallbacks,
+            vnet_inference_elapsed_us: self.vnet_inference_elapsed_us,
         }
     }
 
@@ -146,6 +193,11 @@ impl BenchmarkResult {
                 "avg_planner_time_per_move_ms",
                 "avg_deterministic_nodes",
                 "avg_root_visits_or_samples",
+                "leaf_eval_mode",
+                "vnet_model_path",
+                "vnet_inferences",
+                "vnet_fallbacks",
+                "vnet_inference_elapsed_us",
             ],
             &[vec![
                 "root".to_string(),
@@ -160,6 +212,11 @@ impl BenchmarkResult {
                 self.mean_time_ms.to_string(),
                 self.mean_nodes.to_string(),
                 self.mean_samples.to_string(),
+                format!("{:?}", self.leaf_eval_mode),
+                self.vnet_model_path.clone().unwrap_or_default(),
+                self.vnet_inferences.to_string(),
+                self.vnet_fallbacks.to_string(),
+                self.vnet_inference_elapsed_us.to_string(),
             ]],
         )
     }
@@ -182,7 +239,15 @@ impl AutoplayBenchmarkResult {
             avg_planner_time_per_game_ms: self.average_total_planner_time_per_game_ms,
             avg_deterministic_nodes: self.average_deterministic_nodes,
             avg_root_visits_or_samples: self.average_root_visits,
+            root_parallel_step_count: self.root_parallel_step_count,
+            avg_root_parallel_workers: self.average_root_parallel_workers,
+            avg_root_parallel_simulations: self.average_root_parallel_simulations,
             late_exact_trigger_count: self.late_exact_trigger_count,
+            leaf_eval_mode: format!("{:?}", self.leaf_eval_mode),
+            vnet_model_path: self.vnet_model_path.clone(),
+            vnet_inferences: self.vnet_inferences,
+            vnet_fallbacks: self.vnet_fallbacks,
+            vnet_inference_elapsed_us: self.vnet_inference_elapsed_us,
             termination_counts: self.terminations.clone(),
         }
     }
@@ -210,7 +275,15 @@ impl AutoplayBenchmarkResult {
                 "avg_planner_time_per_game_ms",
                 "avg_deterministic_nodes",
                 "avg_root_visits_or_samples",
+                "root_parallel_step_count",
+                "avg_root_parallel_workers",
+                "avg_root_parallel_simulations",
                 "late_exact_trigger_count",
+                "leaf_eval_mode",
+                "vnet_model_path",
+                "vnet_inferences",
+                "vnet_fallbacks",
+                "vnet_inference_elapsed_us",
                 "termination_counts",
             ],
             &[vec![
@@ -228,7 +301,15 @@ impl AutoplayBenchmarkResult {
                 self.average_total_planner_time_per_game_ms.to_string(),
                 self.average_deterministic_nodes.to_string(),
                 self.average_root_visits.to_string(),
+                self.root_parallel_step_count.to_string(),
+                self.average_root_parallel_workers.to_string(),
+                self.average_root_parallel_simulations.to_string(),
                 self.late_exact_trigger_count.to_string(),
+                format!("{:?}", self.leaf_eval_mode),
+                self.vnet_model_path.clone().unwrap_or_default(),
+                self.vnet_inferences.to_string(),
+                self.vnet_fallbacks.to_string(),
+                self.vnet_inference_elapsed_us.to_string(),
                 termination_counts_string(&self.terminations),
             ]],
         )
@@ -252,7 +333,15 @@ impl AutoplayBenchmarkResult {
                     record.mean_planner_time_per_move_ms.to_string(),
                     record.deterministic_nodes.to_string(),
                     record.root_visits.to_string(),
+                    record.root_parallel_steps.to_string(),
+                    record.root_parallel_worker_count.to_string(),
+                    record.root_parallel_simulations.to_string(),
                     record.late_exact_triggers.to_string(),
+                    format!("{:?}", record.leaf_eval_mode),
+                    record.vnet_model_path.clone().unwrap_or_default(),
+                    record.vnet_inferences.to_string(),
+                    record.vnet_fallbacks.to_string(),
+                    record.vnet_inference_elapsed_us.to_string(),
                 ]
             })
             .collect::<Vec<_>>();
@@ -269,7 +358,15 @@ impl AutoplayBenchmarkResult {
                 "mean_planner_time_per_move_ms",
                 "deterministic_nodes",
                 "root_visits",
+                "root_parallel_steps",
+                "root_parallel_worker_count",
+                "root_parallel_simulations",
                 "late_exact_triggers",
+                "leaf_eval_mode",
+                "vnet_model_path",
+                "vnet_inferences",
+                "vnet_fallbacks",
+                "vnet_inference_elapsed_us",
             ],
             &rows,
         )
@@ -295,6 +392,14 @@ impl AutoplayComparisonResult {
             paired_standard_error: self.paired_standard_error,
             ci_lower: self.ci_lower,
             ci_upper: self.ci_upper,
+            baseline_leaf_eval_mode: format!("{:?}", self.baseline.leaf_eval_mode),
+            candidate_leaf_eval_mode: format!("{:?}", self.candidate.leaf_eval_mode),
+            baseline_vnet_model_path: self.baseline.vnet_model_path.clone(),
+            candidate_vnet_model_path: self.candidate.vnet_model_path.clone(),
+            baseline_vnet_inferences: self.baseline.vnet_inferences,
+            candidate_vnet_inferences: self.candidate.vnet_inferences,
+            baseline_vnet_fallbacks: self.baseline.vnet_fallbacks,
+            candidate_vnet_fallbacks: self.candidate.vnet_fallbacks,
         }
     }
 
@@ -323,6 +428,14 @@ impl AutoplayComparisonResult {
                 "paired_standard_error",
                 "ci_lower",
                 "ci_upper",
+                "baseline_leaf_eval_mode",
+                "candidate_leaf_eval_mode",
+                "baseline_vnet_model_path",
+                "candidate_vnet_model_path",
+                "baseline_vnet_inferences",
+                "candidate_vnet_inferences",
+                "baseline_vnet_fallbacks",
+                "candidate_vnet_fallbacks",
             ],
             &[vec![
                 format!("{:?}", self.baseline.backend),
@@ -341,6 +454,14 @@ impl AutoplayComparisonResult {
                 self.paired_standard_error.to_string(),
                 self.ci_lower.to_string(),
                 self.ci_upper.to_string(),
+                format!("{:?}", self.baseline.leaf_eval_mode),
+                format!("{:?}", self.candidate.leaf_eval_mode),
+                self.baseline.vnet_model_path.clone().unwrap_or_default(),
+                self.candidate.vnet_model_path.clone().unwrap_or_default(),
+                self.baseline.vnet_inferences.to_string(),
+                self.candidate.vnet_inferences.to_string(),
+                self.baseline.vnet_fallbacks.to_string(),
+                self.candidate.vnet_fallbacks.to_string(),
             ]],
         )
     }

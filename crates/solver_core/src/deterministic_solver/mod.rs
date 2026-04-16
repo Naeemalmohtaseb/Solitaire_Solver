@@ -17,6 +17,7 @@ use crate::{
     closure::{ClosureConfig, ClosureEngine, ClosureStopReason, FullClosureRun},
     core::{FullState, VisibleState},
     error::SolverResult,
+    ml::{LeafEvaluationMode, VNetEvaluator, VNetInferenceConfig},
     moves::{
         apply_atomic_move_full_state, generate_legal_macro_moves_with_config,
         undo_atomic_move_full_state, AtomicMove, FullStateMoveUndo, MacroMove, MacroMoveKind,
@@ -131,6 +132,8 @@ pub struct DeterministicSearchConfig {
     pub evaluator_weights: EvaluatorWeights,
     /// Deterministic transposition-table controls.
     pub tt: DeterministicTtConfig,
+    /// Approximate evaluator used at budget/depth cutoffs and fast leaves.
+    pub leaf_eval_mode: LeafEvaluationMode,
 }
 
 impl Default for DeterministicSearchConfig {
@@ -141,6 +144,7 @@ impl Default for DeterministicSearchConfig {
             allow_foundation_retreats: true,
             evaluator_weights: EvaluatorWeights::default(),
             tt: DeterministicTtConfig::default(),
+            leaf_eval_mode: LeafEvaluationMode::Heuristic,
         }
     }
 }
@@ -174,6 +178,12 @@ pub struct DeterministicSearchStats {
     pub tt_replacements: u64,
     /// TT stores that replaced a different key in the same direct-mapped slot.
     pub tt_collisions: u64,
+    /// V-Net inference calls used for approximate leaf evaluation.
+    pub vnet_inferences: u64,
+    /// V-Net inference wall-clock time in microseconds.
+    pub vnet_inference_elapsed_us: u64,
+    /// Times a requested V-Net leaf evaluation fell back to the heuristic.
+    pub vnet_fallbacks: u64,
     /// Elapsed wall-clock time in milliseconds.
     pub elapsed_ms: u64,
 }
@@ -462,6 +472,7 @@ pub struct DeterministicSolver {
     /// Solver configuration.
     pub config: DeterministicSearchConfig,
     tt: RefCell<DeterministicTt>,
+    vnet: Option<VNetEvaluator>,
 }
 
 impl DeterministicSolver {
@@ -475,7 +486,44 @@ impl DeterministicSolver {
         Self {
             config,
             tt: RefCell::new(DeterministicTt::with_capacity(tt_capacity)),
+            vnet: None,
         }
+    }
+
+    /// Creates a deterministic solver with an explicitly supplied V-Net evaluator.
+    pub fn new_with_vnet_evaluator(
+        config: DeterministicSearchConfig,
+        vnet: Option<VNetEvaluator>,
+    ) -> Self {
+        let tt_capacity = if config.tt.enabled {
+            config.tt.capacity
+        } else {
+            0
+        };
+        Self {
+            config,
+            tt: RefCell::new(DeterministicTt::with_capacity(tt_capacity)),
+            vnet,
+        }
+    }
+
+    /// Creates a deterministic solver and attempts to load a configured V-Net.
+    ///
+    /// Loading failures are recorded and leaf evaluation falls back to the
+    /// existing heuristic. Call [`VNetEvaluator::load`](crate::ml::VNetEvaluator::load)
+    /// directly when a hard load error is desired.
+    pub fn new_with_vnet_config(
+        config: DeterministicSearchConfig,
+        vnet_config: &VNetInferenceConfig,
+    ) -> Self {
+        let requested =
+            config.leaf_eval_mode == LeafEvaluationMode::VNet && vnet_config.enable_vnet;
+        let loaded = if requested {
+            VNetEvaluator::load(vnet_config).ok()
+        } else {
+            None
+        };
+        Self::new_with_vnet_evaluator(config, loaded)
     }
 
     /// Clears all deterministic TT entries held by this solver.
@@ -538,19 +586,21 @@ impl DeterministicSolver {
             });
         }
 
-        let value = evaluate_state(&full_state.visible, self.config.evaluator_weights);
+        let value = self.evaluate_leaf_value(full_state, &mut stats);
 
         let mut best_move = None;
         let mut best_value = f32::NEG_INFINITY;
+        let mut child = full_state.clone();
         for macro_move in ordered_macro_moves_with_hint(&full_state.visible, self.config, None) {
-            let mut child = full_state.clone();
             if let Ok(transition) = apply_atomic_move_full_state(&mut child, macro_move.atomic) {
-                let child_value = evaluate_state(&child.visible, self.config.evaluator_weights);
+                let child_value = self.evaluate_leaf_value(&child, &mut stats);
                 undo_atomic_move_full_state(&mut child, transition.undo)?;
                 if child_value > best_value {
                     best_value = child_value;
                     best_move = Some(macro_move);
                 }
+            } else {
+                child = full_state.clone();
             }
         }
         self.store_tt(
@@ -594,10 +644,9 @@ impl DeterministicSolver {
         context: &mut SearchContext,
     ) -> SolverResult<NodeSearchResult> {
         if !context.enter_node(depth) {
-            return Ok(NodeSearchResult::unknown(evaluate_state(
-                &state.visible,
-                self.config.evaluator_weights,
-            )));
+            return Ok(NodeSearchResult::unknown(
+                self.evaluate_leaf_value(state, &mut context.stats),
+            ));
         }
 
         let key = DeterministicHashKey::from_full_state(state);
@@ -616,10 +665,7 @@ impl DeterministicSolver {
             ClosureStopReason::TerminalNoMoves => NodeSearchResult::loss(),
             _ if depth_remaining == 0 => {
                 context.stats.budget_cutoffs += 1;
-                NodeSearchResult::unknown(evaluate_state(
-                    &state.visible,
-                    self.config.evaluator_weights,
-                ))
+                NodeSearchResult::unknown(self.evaluate_leaf_value(state, &mut context.stats))
             }
             _ => self.search_after_closure(state, depth_remaining, depth, context)?,
         };
@@ -643,10 +689,8 @@ impl DeterministicSolver {
             return Ok(NodeSearchResult::loss());
         }
 
-        let mut best = NodeSearchResult::unknown(evaluate_state(
-            &state.visible,
-            self.config.evaluator_weights,
-        ));
+        let mut best =
+            NodeSearchResult::unknown(self.evaluate_leaf_value(state, &mut context.stats));
         let mut all_children_proven_loss = true;
         let mut searched_all_children = true;
 
@@ -778,6 +822,38 @@ impl DeterministicSolver {
         if report.collision {
             stats.tt_collisions += 1;
         }
+    }
+
+    fn evaluate_leaf_value(
+        &self,
+        full_state: &FullState,
+        stats: &mut DeterministicSearchStats,
+    ) -> f32 {
+        if full_state.visible.is_structural_win() {
+            return 1.0;
+        }
+
+        if self.config.leaf_eval_mode == LeafEvaluationMode::VNet {
+            if let Some(vnet) = &self.vnet {
+                let started = Instant::now();
+                match vnet.evaluate_full_state(full_state) {
+                    Ok(value) => {
+                        stats.vnet_inferences = stats.vnet_inferences.saturating_add(1);
+                        stats.vnet_inference_elapsed_us = stats
+                            .vnet_inference_elapsed_us
+                            .saturating_add(started.elapsed().as_micros() as u64);
+                        return value;
+                    }
+                    Err(_) => {
+                        stats.vnet_fallbacks = stats.vnet_fallbacks.saturating_add(1);
+                    }
+                }
+            } else {
+                stats.vnet_fallbacks = stats.vnet_fallbacks.saturating_add(1);
+            }
+        }
+
+        evaluate_state(&full_state.visible, self.config.evaluator_weights)
     }
 }
 
@@ -1134,373 +1210,4 @@ impl StableHashBuilder {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::{
-        cards::Suit,
-        core::{HiddenAssignment, HiddenAssignments, HiddenSlot, TableauColumn},
-        stock::CyclicStockState,
-        types::ColumnId,
-    };
-
-    fn col(index: u8) -> ColumnId {
-        ColumnId::new(index).unwrap()
-    }
-
-    fn card(text: &str) -> Card {
-        text.parse().unwrap()
-    }
-
-    fn complete_foundations() -> crate::core::FoundationState {
-        let mut foundations = crate::core::FoundationState::default();
-        for suit in [Suit::Clubs, Suit::Diamonds, Suit::Hearts, Suit::Spades] {
-            foundations.set_top_rank(suit, Some(Rank::King));
-        }
-        foundations
-    }
-
-    fn foundations_missing_king(suit: Suit) -> crate::core::FoundationState {
-        let mut foundations = complete_foundations();
-        foundations.set_top_rank(suit, Some(Rank::Queen));
-        foundations
-    }
-
-    fn full_from_visible(visible: VisibleState) -> FullState {
-        FullState::new(visible, HiddenAssignments::empty())
-    }
-
-    fn one_move_to_win_state() -> FullState {
-        let mut visible = VisibleState::default();
-        visible.foundations = foundations_missing_king(Suit::Spades);
-        visible.columns[0] = TableauColumn::new(0, vec![card("Ks")]);
-        full_from_visible(visible)
-    }
-
-    fn dead_end_state() -> FullState {
-        let mut visible = VisibleState::default();
-        let cards = (0..Card::COUNT)
-            .map(|index| Card::new(index as u8).unwrap())
-            .collect();
-        visible.stock = CyclicStockState::from_parts(cards, 0, 0, 0, Some(0), 3);
-        full_from_visible(visible)
-    }
-
-    fn reveal_state() -> FullState {
-        let mut visible = VisibleState::default();
-        visible.foundations = complete_foundations();
-        visible
-            .foundations
-            .set_top_rank(Suit::Spades, Some(Rank::Jack));
-        visible.columns[0] = TableauColumn::new(1, vec![card("Qs")]);
-        let slot = HiddenSlot::new(col(0), 0);
-        FullState::new(
-            visible,
-            HiddenAssignments::new(vec![HiddenAssignment::new(slot, card("Ks"))]),
-        )
-    }
-
-    fn closure_invocation_state() -> FullState {
-        let mut visible = VisibleState::default();
-        visible.foundations = complete_foundations();
-        visible.foundations.set_top_rank(Suit::Clubs, None);
-        let clubs = [
-            "2c", "3c", "4c", "5c", "6c", "7c", "8c", "9c", "Tc", "Jc", "Qc", "Kc", "Ac",
-        ];
-        visible.stock = CyclicStockState::from_parts(
-            clubs.iter().map(|text| card(text)).collect(),
-            0,
-            1,
-            0,
-            Some(0),
-            3,
-        );
-        full_from_visible(visible)
-    }
-
-    fn tt_config(enabled: bool) -> DeterministicSearchConfig {
-        DeterministicSearchConfig {
-            tt: DeterministicTtConfig {
-                enabled,
-                capacity: if enabled { 32 } else { 0 },
-                store_approx: true,
-            },
-            ..DeterministicSearchConfig::default()
-        }
-    }
-
-    #[test]
-    fn already_won_full_state_returns_exact_terminal_win() {
-        let mut visible = VisibleState::default();
-        visible.foundations = complete_foundations();
-        let full = full_from_visible(visible);
-
-        let result = DeterministicSolver::default().solve_exact(&full).unwrap();
-
-        assert_eq!(result.outcome, SolveOutcome::ProvenWin);
-        assert_eq!(result.value, 1.0);
-        assert!(result.best_move.is_none());
-    }
-
-    #[test]
-    fn no_move_dead_end_returns_proven_loss() {
-        let full = dead_end_state();
-
-        let result = DeterministicSolver::default().solve_exact(&full).unwrap();
-
-        assert_eq!(result.outcome, SolveOutcome::ProvenLoss);
-        assert_eq!(result.value, 0.0);
-    }
-
-    #[test]
-    fn solver_identifies_trivial_one_move_win() {
-        let full = one_move_to_win_state();
-
-        let result = DeterministicSolver::default().solve_exact(&full).unwrap();
-
-        assert_eq!(result.outcome, SolveOutcome::ProvenWin);
-        assert!(matches!(
-            result.best_move.map(|best| best.kind),
-            Some(MacroMoveKind::MoveTopToFoundation { .. })
-        ));
-        assert_eq!(
-            result.principal_line,
-            vec![MacroMoveKind::MoveTopToFoundation { src: col(0) }]
-        );
-    }
-
-    #[test]
-    fn full_state_reveal_apply_uses_and_removes_hidden_assignment() {
-        let mut full = reveal_state();
-
-        let transition = apply_atomic_move_full_state(
-            &mut full,
-            AtomicMove::TableauToFoundation { src: col(0) },
-        )
-        .unwrap();
-
-        assert!(full.hidden_assignments.is_empty());
-        assert_eq!(full.visible.columns[0].face_up, vec![card("Ks")]);
-        assert_eq!(transition.outcome.revealed.unwrap().card, card("Ks"));
-    }
-
-    #[test]
-    fn full_state_reveal_apply_undo_is_symmetric() {
-        let mut full = reveal_state();
-        let before = full.clone();
-
-        let transition = apply_atomic_move_full_state(
-            &mut full,
-            AtomicMove::TableauToFoundation { src: col(0) },
-        )
-        .unwrap();
-        undo_atomic_move_full_state(&mut full, transition.undo).unwrap();
-
-        assert_eq!(full, before);
-    }
-
-    #[test]
-    fn move_ordering_is_deterministic_and_prioritizes_reveals() {
-        let full = reveal_state();
-
-        let first = ordered_macro_moves(&full.visible, DeterministicSearchConfig::default());
-        let second = ordered_macro_moves(&full.visible, DeterministicSearchConfig::default());
-
-        assert_eq!(first, second);
-        assert!(first[0].semantics.causes_reveal);
-    }
-
-    #[test]
-    fn bounded_solve_respects_depth_budget() {
-        let full = one_move_to_win_state();
-        let solver = DeterministicSolver::new(DeterministicSearchConfig {
-            budget: SolveBudget {
-                node_budget: Some(100),
-                depth_budget: Some(0),
-                wall_clock_limit_ms: None,
-            },
-            ..DeterministicSearchConfig::default()
-        });
-
-        let result = solver.solve_bounded(&full).unwrap();
-
-        assert_eq!(result.outcome, SolveOutcome::Unknown);
-        assert!(result.stats.budget_cutoffs > 0);
-    }
-
-    #[test]
-    fn fast_evaluation_returns_stable_result_on_simple_state() {
-        let full = one_move_to_win_state();
-        let solver = DeterministicSolver::default();
-
-        let first = solver.evaluate_fast(&full).unwrap();
-        let second = solver.evaluate_fast(&full).unwrap();
-
-        assert_eq!(first.value, second.value);
-        assert!(first.value > 0.0);
-    }
-
-    #[test]
-    fn closure_is_invoked_during_search() {
-        let full = closure_invocation_state();
-
-        let result = DeterministicSolver::default().solve_bounded(&full).unwrap();
-
-        assert!(result.stats.closure_steps_applied > 0);
-    }
-
-    #[test]
-    fn bounded_solver_returns_best_move_when_one_exists() {
-        let full = one_move_to_win_state();
-
-        let result = DeterministicSolver::default().solve_bounded(&full).unwrap();
-
-        assert!(result.best_move.is_some());
-    }
-
-    #[test]
-    fn same_full_state_hashes_identically() {
-        let full = reveal_state();
-
-        let first = DeterministicHashKey::from_full_state(&full);
-        let second = DeterministicHashKey::from_full_state(&full.clone());
-
-        assert_eq!(first, second);
-    }
-
-    #[test]
-    fn equivalent_repeated_state_is_found_in_tt() {
-        let full = one_move_to_win_state();
-        let key = DeterministicHashKey::from_full_state(&full);
-        let mut tt = DeterministicTt::with_capacity(16);
-        let entry = DeterministicTtEntry {
-            key,
-            value: DeterministicTtValue {
-                outcome: SolveOutcome::ProvenWin,
-                value: 1.0,
-                bound: DeterministicBound::Exact,
-            },
-            best_move: None,
-            searched_depth: 4,
-            age: 0,
-        };
-
-        assert!(tt.store(entry).stored);
-        assert_eq!(
-            tt.probe(key).unwrap().value.bound,
-            DeterministicBound::Exact
-        );
-    }
-
-    #[test]
-    fn exact_tt_entry_is_reused_on_repeated_solve() {
-        let full = one_move_to_win_state();
-        let solver = DeterministicSolver::new(tt_config(true));
-
-        let first = solver.solve_exact(&full).unwrap();
-        let second = solver.solve_exact(&full).unwrap();
-
-        assert_eq!(first.outcome, SolveOutcome::ProvenWin);
-        assert_eq!(second.outcome, SolveOutcome::ProvenWin);
-        assert!(second.stats.tt_exact_hits > 0);
-    }
-
-    #[test]
-    fn approximate_tt_entry_does_not_masquerade_as_exact() {
-        let full = one_move_to_win_state();
-        let solver = DeterministicSolver::new(tt_config(true));
-        let key = DeterministicHashKey::from_full_state(&full);
-
-        solver.tt.borrow_mut().store(DeterministicTtEntry {
-            key,
-            value: DeterministicTtValue {
-                outcome: SolveOutcome::Unknown,
-                value: 0.25,
-                bound: DeterministicBound::Approx,
-            },
-            best_move: None,
-            searched_depth: u16::MAX,
-            age: 0,
-        });
-
-        let result = solver.solve_exact(&full).unwrap();
-
-        assert_eq!(result.outcome, SolveOutcome::ProvenWin);
-        assert_eq!(result.value, 1.0);
-        assert_eq!(result.stats.tt_exact_hits, 0);
-    }
-
-    #[test]
-    fn tt_best_move_hint_influences_ordering_deterministically() {
-        let mut visible = VisibleState::default();
-        visible.columns[0] = TableauColumn::new(0, vec![card("Kh")]);
-        visible.columns[1] = TableauColumn::new(0, vec![card("Ks")]);
-
-        let base = ordered_macro_moves(&visible, DeterministicSearchConfig::default());
-        assert!(base.len() > 1);
-        let hint = base.last().cloned().unwrap();
-        let hinted = ordered_macro_moves_with_hint(
-            &visible,
-            DeterministicSearchConfig::default(),
-            Some(&hint),
-        );
-
-        assert!(same_macro_action(&hint, &hinted[0]));
-    }
-
-    #[test]
-    fn bounded_capacity_tt_remains_safe() {
-        let first = one_move_to_win_state();
-        let second = reveal_state();
-        let mut tt = DeterministicTt::with_capacity(1);
-
-        for full in [&first, &second] {
-            let key = DeterministicHashKey::from_full_state(full);
-            tt.store(DeterministicTtEntry {
-                key,
-                value: DeterministicTtValue {
-                    outcome: SolveOutcome::Unknown,
-                    value: 0.5,
-                    bound: DeterministicBound::Approx,
-                },
-                best_move: None,
-                searched_depth: 0,
-                age: 0,
-            });
-        }
-
-        assert_eq!(tt.capacity(), 1);
-        assert!(
-            tt.probe(DeterministicHashKey::from_full_state(&first))
-                .is_some()
-                || tt
-                    .probe(DeterministicHashKey::from_full_state(&second))
-                    .is_some()
-        );
-    }
-
-    #[test]
-    fn solver_with_tt_matches_solver_without_tt_on_simple_exact_case() {
-        let full = one_move_to_win_state();
-
-        let with_tt = DeterministicSolver::new(tt_config(true))
-            .solve_exact(&full)
-            .unwrap();
-        let without_tt = DeterministicSolver::new(tt_config(false))
-            .solve_exact(&full)
-            .unwrap();
-
-        assert_eq!(with_tt.outcome, without_tt.outcome);
-        assert_eq!(with_tt.value, without_tt.value);
-    }
-
-    #[test]
-    fn reveal_position_with_tt_preserves_correctness() {
-        let full = reveal_state();
-        let solver = DeterministicSolver::new(tt_config(true));
-
-        let result = solver.solve_exact(&full).unwrap();
-
-        assert_eq!(result.outcome, SolveOutcome::ProvenWin);
-        assert!(result.stats.tt_stores > 0);
-    }
-}
+mod tests;

@@ -11,6 +11,7 @@ use crate::{
     cards::Card,
     core::{
         BeliefState, FullState, HiddenAssignment, HiddenAssignments, HiddenSlot, UnseenCardSet,
+        VisibleState,
     },
     error::{SolverError, SolverResult},
     moves::{apply_atomic_move, requires_reveal, AtomicMove, MoveOutcome, MoveSemantics},
@@ -174,14 +175,73 @@ impl WorldSampler {
         belief: &BeliefState,
         samples: usize,
     ) -> SolverResult<Vec<DeterminizationSample>> {
+        if samples == 0 {
+            return Ok(Vec::new());
+        }
+
+        let mut prepared = PreparedWorldSampler::new_with_rng(belief, self.rng)?;
         let mut worlds = Vec::with_capacity(samples);
         for sample_index in 0..samples {
             worlds.push(DeterminizationSample {
                 sample_index,
-                full_state: self.sample_full_state(belief)?,
+                full_state: prepared.sample_full_state()?,
             });
         }
+        self.rng = prepared.into_rng();
         Ok(worlds)
+    }
+}
+
+/// Prepared uniform world sampler for repeated samples from one belief state.
+///
+/// It caches deterministic hidden-slot order and sorted unseen cards once, then
+/// shuffles a local card vector for each sample. The posterior remains exactly
+/// uniform over assignments of unseen cards to hidden tableau slots.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreparedWorldSampler {
+    visible: VisibleState,
+    slots: Vec<HiddenSlot>,
+    sorted_cards: Vec<Card>,
+    rng: SplitMix64,
+}
+
+impl PreparedWorldSampler {
+    /// Creates a prepared sampler from a belief state and seed.
+    pub fn new(belief: &BeliefState, seed: DealSeed) -> SolverResult<Self> {
+        Self::new_with_rng(belief, SplitMix64::new(seed.0))
+    }
+
+    fn new_with_rng(belief: &BeliefState, rng: SplitMix64) -> SolverResult<Self> {
+        belief.validate_consistency_against_visible()?;
+        let slots = belief.visible.hidden_slots();
+        let sorted_cards = belief.unseen_cards.to_sorted_vec();
+        if slots.len() != sorted_cards.len() {
+            return Err(SolverError::UnseenCountMismatch {
+                expected: slots.len(),
+                actual: sorted_cards.len(),
+            });
+        }
+
+        Ok(Self {
+            visible: belief.visible.clone(),
+            slots,
+            sorted_cards,
+            rng,
+        })
+    }
+
+    /// Samples one full deterministic state from the prepared belief state.
+    pub fn sample_full_state(&mut self) -> SolverResult<FullState> {
+        sample_full_state_from_parts(
+            &self.visible,
+            &self.slots,
+            &self.sorted_cards,
+            &mut self.rng,
+        )
+    }
+
+    fn into_rng(self) -> SplitMix64 {
+        self.rng
     }
 }
 
@@ -412,25 +472,33 @@ fn sample_full_state_with_rng(
     belief.validate_consistency_against_visible()?;
 
     let slots = belief.visible.hidden_slots();
-    let mut cards = belief.unseen_cards.to_sorted_vec();
-    if slots.len() != cards.len() {
+    let sorted_cards = belief.unseen_cards.to_sorted_vec();
+    if slots.len() != sorted_cards.len() {
         return Err(SolverError::UnseenCountMismatch {
             expected: slots.len(),
-            actual: cards.len(),
+            actual: sorted_cards.len(),
         });
     }
 
+    sample_full_state_from_parts(&belief.visible, &slots, &sorted_cards, rng)
+}
+
+fn sample_full_state_from_parts(
+    visible: &VisibleState,
+    slots: &[HiddenSlot],
+    sorted_cards: &[Card],
+    rng: &mut SplitMix64,
+) -> SolverResult<FullState> {
+    let mut cards = sorted_cards.to_vec();
     shuffle_cards(&mut cards, rng);
-    let assignments = HiddenAssignments::new(
-        slots
-            .into_iter()
-            .zip(cards)
-            .map(|(slot, card)| HiddenAssignment::new(slot, card))
-            .collect(),
-    );
-    let full_state = FullState::new(belief.visible.clone(), assignments);
-    validate_sample_against_belief(&full_state, belief)?;
-    Ok(full_state)
+    let mut entries = Vec::with_capacity(slots.len());
+    for (slot, card) in slots.iter().copied().zip(cards) {
+        entries.push(HiddenAssignment::new(slot, card));
+    }
+    Ok(FullState::new(
+        visible.clone(),
+        HiddenAssignments::new(entries),
+    ))
 }
 
 fn shuffle_cards(cards: &mut [Card], rng: &mut SplitMix64) {

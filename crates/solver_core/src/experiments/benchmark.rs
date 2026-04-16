@@ -7,13 +7,14 @@ use crate::{
     core::{BeliefState, FullState},
     deterministic_solver::DeterministicSearchConfig,
     error::SolverResult,
+    ml::{LeafEvaluationMode, VNetInferenceConfig},
     types::DealSeed,
 };
 
 use super::{
-    generate_benchmark_deal, mean, play_game_with_planner, recommend_move_pimc, standard_error,
-    summarize_autoplay_benchmark, summarize_benchmark, AutoplayConfig, AutoplayTermination,
-    PimcConfig, PlannerBackend,
+    generate_benchmark_deal, mean, play_game_with_planner, standard_error,
+    summarize_autoplay_benchmark, summarize_benchmark, vnet_model_path_string, AutoplayConfig,
+    AutoplayTermination, PimcConfig, PlannerBackend,
 };
 /// A reproducible suite of deals identified by seed.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -145,6 +146,8 @@ pub struct BenchmarkConfig {
     pub pimc: PimcConfig,
     /// Deterministic continuation configuration.
     pub deterministic: DeterministicSearchConfig,
+    /// Optional V-Net inference controls used by deterministic continuations.
+    pub vnet_inference: VNetInferenceConfig,
 }
 
 /// Deterministic deal generated from a seed.
@@ -173,6 +176,16 @@ pub struct BenchmarkRecord {
     pub sample_count: usize,
     /// Deterministic continuation nodes used.
     pub deterministic_nodes: u64,
+    /// Leaf evaluation mode configured for deterministic continuations.
+    pub leaf_eval_mode: LeafEvaluationMode,
+    /// V-Net model path configured for this decision, if any.
+    pub vnet_model_path: Option<String>,
+    /// V-Net inference calls used.
+    pub vnet_inferences: u64,
+    /// V-Net fallback count.
+    pub vnet_fallbacks: u64,
+    /// V-Net inference time in microseconds.
+    pub vnet_inference_elapsed_us: u64,
 }
 
 /// Result of one single-config benchmark run.
@@ -200,6 +213,16 @@ pub struct BenchmarkResult {
     pub mean_nodes: f64,
     /// Mean PIMC samples per root decision.
     pub mean_samples: f64,
+    /// Leaf evaluation mode configured for deterministic continuations.
+    pub leaf_eval_mode: LeafEvaluationMode,
+    /// V-Net model path configured for this run, if any.
+    pub vnet_model_path: Option<String>,
+    /// Total V-Net inference calls used.
+    pub vnet_inferences: u64,
+    /// Total V-Net fallback count.
+    pub vnet_fallbacks: u64,
+    /// Total V-Net inference time in microseconds.
+    pub vnet_inference_elapsed_us: u64,
 }
 
 /// Backward-compatible compact benchmark summary.
@@ -342,8 +365,24 @@ pub struct AutoplayBenchmarkRecord {
     pub deterministic_nodes: u64,
     /// Root simulations/samples/visits reported by planners.
     pub root_visits: u64,
+    /// Number of moves that used root-parallel planner workers.
+    pub root_parallel_steps: usize,
+    /// Sum of root workers used across this game.
+    pub root_parallel_worker_count: usize,
+    /// Total root-parallel worker simulations for this game.
+    pub root_parallel_simulations: usize,
     /// Number of autoplay steps where late-exact triggered.
     pub late_exact_triggers: usize,
+    /// Leaf evaluation mode configured for this game.
+    pub leaf_eval_mode: LeafEvaluationMode,
+    /// V-Net model path configured for this game, if any.
+    pub vnet_model_path: Option<String>,
+    /// V-Net inference calls used.
+    pub vnet_inferences: u64,
+    /// V-Net fallback count.
+    pub vnet_fallbacks: u64,
+    /// V-Net inference time in microseconds.
+    pub vnet_inference_elapsed_us: u64,
 }
 
 /// Count for one autoplay termination reason.
@@ -386,8 +425,24 @@ pub struct AutoplayBenchmarkResult {
     pub average_deterministic_nodes: f64,
     /// Average root visits per game.
     pub average_root_visits: f64,
+    /// Total moves that used root-parallel planner workers.
+    pub root_parallel_step_count: usize,
+    /// Average root-parallel workers per game.
+    pub average_root_parallel_workers: f64,
+    /// Average root-parallel worker simulations per game.
+    pub average_root_parallel_simulations: f64,
     /// Total late-exact trigger count.
     pub late_exact_trigger_count: usize,
+    /// Leaf evaluation mode configured for this run.
+    pub leaf_eval_mode: LeafEvaluationMode,
+    /// V-Net model path configured for this run, if any.
+    pub vnet_model_path: Option<String>,
+    /// Total V-Net inference calls used.
+    pub vnet_inferences: u64,
+    /// Total V-Net fallback count.
+    pub vnet_fallbacks: u64,
+    /// Total V-Net inference time in microseconds.
+    pub vnet_inference_elapsed_us: u64,
     /// Termination reason counts.
     pub terminations: Vec<AutoplayTerminationCount>,
 }
@@ -509,8 +564,12 @@ impl ExperimentRunner {
         let mut records = Vec::with_capacity(suite.seeds.len());
         for seed in &suite.seeds {
             let deal = self.generate_deal(*seed)?;
-            let recommendation =
-                recommend_move_pimc(&deal.belief_state, config.deterministic, config.pimc)?;
+            let recommendation = super::recommend_move_pimc_with_vnet(
+                &deal.belief_state,
+                config.deterministic,
+                config.pimc,
+                config.vnet_inference.clone(),
+            )?;
             let win = recommendation.best_value >= 0.5;
             records.push(BenchmarkRecord {
                 seed: *seed,
@@ -519,6 +578,15 @@ impl ExperimentRunner {
                 elapsed_ms: recommendation.elapsed_ms,
                 sample_count: recommendation.sample_count,
                 deterministic_nodes: recommendation.deterministic_nodes,
+                leaf_eval_mode: config.deterministic.leaf_eval_mode,
+                vnet_model_path: config
+                    .vnet_inference
+                    .model_path
+                    .as_ref()
+                    .map(|path| path.display().to_string()),
+                vnet_inferences: recommendation.vnet_inferences,
+                vnet_fallbacks: recommendation.vnet_fallbacks,
+                vnet_inference_elapsed_us: recommendation.vnet_inference_elapsed_us,
             });
         }
         Ok(summarize_benchmark(config.label.clone(), suite, records))
@@ -658,7 +726,15 @@ impl ExperimentRunner {
                 },
                 deterministic_nodes: result.deterministic_nodes,
                 root_visits: result.root_visits,
+                root_parallel_steps: result.root_parallel_steps,
+                root_parallel_worker_count: result.root_parallel_worker_count,
+                root_parallel_simulations: result.root_parallel_simulations,
                 late_exact_triggers: result.late_exact_triggers,
+                leaf_eval_mode: config.solver.deterministic.leaf_eval_mode,
+                vnet_model_path: vnet_model_path_string(&config.solver),
+                vnet_inferences: result.vnet_inferences,
+                vnet_fallbacks: result.vnet_fallbacks,
+                vnet_inference_elapsed_us: result.vnet_inference_elapsed_us,
             });
         }
         Ok(summarize_autoplay_benchmark(

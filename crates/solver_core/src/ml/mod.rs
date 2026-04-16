@@ -1,13 +1,14 @@
-//! Machine-learning dataset export surfaces.
+//! Machine-learning dataset export and inference surfaces.
 //!
 //! This module prepares deterministic full-state examples for a future V-Net.
-//! It does not contain neural inference, model training, PyTorch bindings, or
-//! policy-network logic.
+//! It also owns the optional Rust-native V-Net inference hook used only as an
+//! approximate leaf evaluator. It does not contain model training, PyTorch
+//! bindings, or policy-network logic.
 
 use std::{
     fs::{self, File},
     io::{BufWriter, Write},
-    path::Path,
+    path::{Path, PathBuf},
 };
 
 use serde::{Deserialize, Serialize};
@@ -75,6 +76,61 @@ pub enum VNetLabelMode {
     DeterministicSolverValue,
     /// Label each decision state with the hidden-information planner's root value.
     PlannerBackedApproximateValue,
+}
+
+/// Approximate leaf evaluator selected by deterministic search cutoffs.
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum LeafEvaluationMode {
+    /// Use the existing handcrafted deterministic cutoff evaluator.
+    Heuristic,
+    /// Use a loaded V-Net inference artifact, falling back to the heuristic when unavailable.
+    VNet,
+}
+
+impl Default for LeafEvaluationMode {
+    fn default() -> Self {
+        Self::Heuristic
+    }
+}
+
+/// Runtime used for V-Net inference in Rust.
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum VNetBackend {
+    /// Rust-native MLP loaded from a JSON inference artifact written by Python training.
+    RustMlpJson,
+}
+
+impl Default for VNetBackend {
+    fn default() -> Self {
+        Self::RustMlpJson
+    }
+}
+
+/// Configuration for optional V-Net inference.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VNetInferenceConfig {
+    /// Enables V-Net loading/use for approximate leaf evaluation.
+    pub enable_vnet: bool,
+    /// Inference backend to use.
+    pub backend: VNetBackend,
+    /// Path to the Rust-native V-Net JSON artifact.
+    pub model_path: Option<PathBuf>,
+    /// Whether search should fall back to the heuristic if loading/evaluation fails.
+    pub fallback_to_heuristic: bool,
+    /// Whether future callers may request batch evaluation.
+    pub batch_leaf_eval: bool,
+}
+
+impl Default for VNetInferenceConfig {
+    fn default() -> Self {
+        Self {
+            enable_vnet: false,
+            backend: VNetBackend::RustMlpJson,
+            model_path: None,
+            fallback_to_heuristic: true,
+            batch_leaf_eval: false,
+        }
+    }
 }
 
 /// Dataset file format supported by the v1 exporter.
@@ -170,7 +226,12 @@ pub struct DatasetMetadata {
     pub games: usize,
     /// Number of examples written.
     pub example_count: usize,
+    /// Export every Nth autoplay decision state.
+    pub decision_stride: usize,
 }
+
+/// Model-specific alias for V-Net dataset metadata.
+pub type VNetDatasetMetadata = DatasetMetadata;
 
 /// Full deterministic state encoding for V-Net training.
 ///
@@ -208,6 +269,9 @@ pub struct VNetStateEncoding {
     /// Shape metadata for `flat_features`.
     pub shape: EncodedStateShape,
 }
+
+/// Stable full-state encoding used by V-Net JSONL examples.
+pub type EncodedFullState = VNetStateEncoding;
 
 impl VNetStateEncoding {
     /// Encodes one full deterministic state.
@@ -387,6 +451,8 @@ pub struct VNetExportConfig {
     pub max_steps: Option<usize>,
     /// Whether to include the final state reached by each autoplay run.
     pub include_terminal_state: bool,
+    /// Export every Nth autoplay decision state. Must be greater than zero.
+    pub decision_stride: usize,
     /// Output format.
     pub format: DatasetFormat,
 }
@@ -398,6 +464,7 @@ impl Default for VNetExportConfig {
             split_strategy: DatasetSplitStrategy::AllTrain,
             max_steps: None,
             include_terminal_state: true,
+            decision_stride: 1,
             format: DatasetFormat::Jsonl,
         }
     }
@@ -420,12 +487,158 @@ pub enum VNetDatasetRecord {
 }
 
 /// Dataset writer for V-Net exports.
-#[derive(Debug, Copy, Clone, Default, PartialEq, Eq)]
-pub struct VNetDatasetWriter;
+#[derive(Debug)]
+pub struct VNetDatasetWriter {
+    writer: BufWriter<File>,
+    path: PathBuf,
+}
+
+/// Activation function stored in a Rust-native V-Net inference artifact.
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VNetActivation {
+    /// No activation.
+    Linear,
+    /// Rectified linear unit.
+    Relu,
+    /// Logistic sigmoid.
+    Sigmoid,
+}
+
+/// One dense layer in a Rust-native V-Net MLP artifact.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct VNetLayerArtifact {
+    /// Dense weights in `[out][in]` order.
+    pub weights: Vec<Vec<f32>>,
+    /// Dense biases in output order.
+    pub biases: Vec<f32>,
+    /// Activation applied after the affine transform.
+    pub activation: VNetActivation,
+}
+
+/// Rust-native inference artifact written by the Python training scaffold.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct VNetInferenceArtifact {
+    /// Stable artifact schema.
+    pub schema_version: String,
+    /// Model role, expected to be `VNet`.
+    pub model_role: String,
+    /// Model kind, expected to be `mlp`.
+    pub model_type: String,
+    /// Expected flat feature count.
+    pub input_dim: usize,
+    /// Hidden layer sizes for diagnostics.
+    pub hidden_sizes: Vec<usize>,
+    /// Feature normalization, currently `scale64` or `none`.
+    pub feature_normalization: String,
+    /// Label mode used to train the artifact, if known.
+    pub label_mode: Option<String>,
+    /// Dataset metadata snapshot from training, if present.
+    pub dataset_metadata: Option<serde_json::Value>,
+    /// Dense layers in execution order.
+    pub layers: Vec<VNetLayerArtifact>,
+}
+
+/// Loaded V-Net evaluator.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct VNetEvaluator {
+    /// Backend used by this evaluator.
+    pub backend: VNetBackend,
+    /// Loaded model artifact.
+    pub artifact: VNetInferenceArtifact,
+}
+
+impl VNetEvaluator {
+    /// Loads a V-Net evaluator from a configured inference artifact.
+    pub fn load(config: &VNetInferenceConfig) -> SolverResult<Self> {
+        if !config.enable_vnet {
+            return Err(SolverError::Unsupported("V-Net inference is disabled"));
+        }
+        let path = config.model_path.as_ref().ok_or_else(|| {
+            SolverError::InvalidState("V-Net inference requires model_path".to_string())
+        })?;
+        let text = fs::read_to_string(path)?;
+        let artifact: VNetInferenceArtifact = serde_json::from_str(&text)
+            .map_err(|error| SolverError::Serialization(error.to_string()))?;
+        Self::from_artifact(config.backend, artifact)
+    }
+
+    /// Builds an evaluator from an already-loaded artifact.
+    pub fn from_artifact(
+        backend: VNetBackend,
+        artifact: VNetInferenceArtifact,
+    ) -> SolverResult<Self> {
+        validate_vnet_artifact(&artifact)?;
+        Ok(Self { backend, artifact })
+    }
+
+    /// Evaluates one fully known state by reusing the existing V-Net encoding.
+    pub fn evaluate_full_state(&self, full_state: &FullState) -> SolverResult<f32> {
+        let encoding = VNetStateEncoding::from_full_state(full_state)?;
+        self.evaluate_encoding(&encoding)
+    }
+
+    /// Evaluates one encoded full state.
+    pub fn evaluate_encoding(&self, encoding: &EncodedFullState) -> SolverResult<f32> {
+        self.evaluate_flat_features(&encoding.flat_features)
+    }
+
+    /// Evaluates a flat feature vector from the Rust V-Net export format.
+    pub fn evaluate_flat_features(&self, flat_features: &[i16]) -> SolverResult<f32> {
+        if flat_features.len() != self.artifact.input_dim {
+            return Err(SolverError::InvalidState(format!(
+                "V-Net input dimension mismatch: expected {}, actual {}",
+                self.artifact.input_dim,
+                flat_features.len()
+            )));
+        }
+
+        let mut values = flat_features
+            .iter()
+            .map(|value| f32::from(*value))
+            .collect::<Vec<_>>();
+        match self.artifact.feature_normalization.as_str() {
+            "scale64" => {
+                for value in &mut values {
+                    *value /= 64.0;
+                }
+            }
+            "none" => {}
+            other => {
+                return Err(SolverError::InvalidState(format!(
+                    "unsupported V-Net feature normalization {other:?}"
+                )));
+            }
+        }
+
+        for layer in &self.artifact.layers {
+            values = apply_vnet_layer(&values, layer)?;
+        }
+
+        values
+            .first()
+            .copied()
+            .ok_or_else(|| {
+                SolverError::InvalidState("V-Net artifact produced no output".to_string())
+            })
+            .map(|value| value.clamp(0.0, 1.0))
+    }
+
+    /// Evaluates a batch of encoded full states.
+    pub fn evaluate_batch(&self, encodings: &[EncodedFullState]) -> SolverResult<Vec<f32>> {
+        encodings
+            .iter()
+            .map(|encoding| self.evaluate_encoding(encoding))
+            .collect()
+    }
+}
 
 impl VNetDatasetWriter {
-    /// Writes a V-Net dataset as JSONL.
-    pub fn write_jsonl(path: impl AsRef<Path>, dataset: &VNetDataset) -> SolverResult<()> {
+    /// Opens a JSONL writer and writes the metadata record immediately.
+    pub fn create_jsonl(
+        path: impl AsRef<Path>,
+        metadata: &VNetDatasetMetadata,
+    ) -> SolverResult<Self> {
         let path = path.as_ref();
         if let Some(parent) = path
             .parent()
@@ -433,24 +646,54 @@ impl VNetDatasetWriter {
         {
             fs::create_dir_all(parent)?;
         }
+
         let file = File::create(path)?;
         let mut writer = BufWriter::new(file);
         write_jsonl_record(
             &mut writer,
             &VNetDatasetRecord::Metadata {
-                metadata: dataset.metadata.clone(),
+                metadata: metadata.clone(),
             },
         )?;
-        for example in &dataset.examples {
-            write_jsonl_record(
-                &mut writer,
-                &VNetDatasetRecord::Example {
-                    example: example.clone(),
-                },
-            )?;
-        }
-        writer.flush()?;
+        Ok(Self {
+            writer,
+            path: path.to_path_buf(),
+        })
+    }
+
+    /// Appends one V-Net example record.
+    pub fn append_example(&mut self, example: &VNetExample) -> SolverResult<()> {
+        write_jsonl_record(
+            &mut self.writer,
+            &VNetDatasetRecord::Example {
+                example: example.clone(),
+            },
+        )
+    }
+
+    /// Flushes buffered output.
+    pub fn flush(&mut self) -> SolverResult<()> {
+        self.writer.flush()?;
         Ok(())
+    }
+
+    /// Flushes and closes the writer.
+    pub fn finish(mut self) -> SolverResult<()> {
+        self.flush()
+    }
+
+    /// Returns the output path.
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Writes a V-Net dataset as JSONL.
+    pub fn write_jsonl(path: impl AsRef<Path>, dataset: &VNetDataset) -> SolverResult<()> {
+        let mut writer = Self::create_jsonl(path, &dataset.metadata)?;
+        for example in &dataset.examples {
+            writer.append_example(example)?;
+        }
+        writer.finish()
     }
 }
 
@@ -495,6 +738,12 @@ pub fn collect_vnet_examples_from_autoplay_suite(
     preset: &ExperimentPreset,
     export_config: &VNetExportConfig,
 ) -> SolverResult<VNetDataset> {
+    if export_config.decision_stride == 0 {
+        return Err(SolverError::InvalidState(
+            "V-Net export decision_stride must be greater than zero".to_string(),
+        ));
+    }
+
     let mut autoplay_config = preset.autoplay;
     if let Some(max_steps) = export_config.max_steps {
         autoplay_config.max_steps = max_steps;
@@ -515,6 +764,7 @@ pub fn collect_vnet_examples_from_autoplay_suite(
             &preset.solver,
             &autoplay_config,
             export_config.include_terminal_state,
+            export_config.decision_stride,
             split,
         )?);
     }
@@ -547,6 +797,7 @@ pub fn collect_vnet_examples_from_autoplay_suite(
         suite: suite.description(),
         games: suite.seeds.len(),
         example_count: examples.len(),
+        decision_stride: export_config.decision_stride,
     };
 
     Ok(VNetDataset { metadata, examples })
@@ -580,6 +831,7 @@ fn collect_pending_autoplay_examples_for_deal(
     solver_config: &crate::config::SolverConfig,
     autoplay_config: &crate::experiments::AutoplayConfig,
     include_terminal_state: bool,
+    decision_stride: usize,
     split: DatasetSplit,
 ) -> SolverResult<Vec<PendingVNetExample>> {
     let mut true_state = full_state;
@@ -608,22 +860,24 @@ fn collect_pending_autoplay_examples_for_deal(
         )?;
         total_planner_time_ms = total_planner_time_ms.saturating_add(decision.snapshot.elapsed_ms);
 
-        pending.push(PendingVNetExample {
-            full_state: true_state.clone(),
-            provenance: VNetProvenance {
-                source: VNetDataSource::AutoplayTrace,
-                preset_name: preset_name.to_string(),
-                deal_seed: seed,
-                step_index: Some(step_index),
-                chosen_move: decision
-                    .best_move
-                    .as_ref()
-                    .map(|macro_move| macro_move.kind),
-                planner_value: Some(decision.snapshot.best_value),
-                terminal_won: None,
-            },
-            split,
-        });
+        if step_index % decision_stride == 0 {
+            pending.push(PendingVNetExample {
+                full_state: true_state.clone(),
+                provenance: VNetProvenance {
+                    source: VNetDataSource::AutoplayTrace,
+                    preset_name: preset_name.to_string(),
+                    deal_seed: seed,
+                    step_index: Some(step_index),
+                    chosen_move: decision
+                        .best_move
+                        .as_ref()
+                        .map(|macro_move| macro_move.kind),
+                    planner_value: Some(decision.snapshot.best_value),
+                    terminal_won: None,
+                },
+                split,
+            });
+        }
 
         let Some(chosen_move) = decision.best_move else {
             break;
@@ -703,6 +957,105 @@ fn write_jsonl_record(
     Ok(())
 }
 
+fn validate_vnet_artifact(artifact: &VNetInferenceArtifact) -> SolverResult<()> {
+    if artifact.schema_version != "solitaire-vnet-mlp-json-v1" {
+        return Err(SolverError::InvalidState(format!(
+            "unsupported V-Net artifact schema {:?}",
+            artifact.schema_version
+        )));
+    }
+    if artifact.model_role != "VNet" {
+        return Err(SolverError::InvalidState(format!(
+            "V-Net artifact has wrong model_role {:?}",
+            artifact.model_role
+        )));
+    }
+    if artifact.model_type != "mlp" {
+        return Err(SolverError::InvalidState(format!(
+            "unsupported V-Net model_type {:?}",
+            artifact.model_type
+        )));
+    }
+    if artifact.input_dim == 0 {
+        return Err(SolverError::InvalidState(
+            "V-Net artifact input_dim must be positive".to_string(),
+        ));
+    }
+    if artifact.layers.is_empty() {
+        return Err(SolverError::InvalidState(
+            "V-Net artifact must contain at least one layer".to_string(),
+        ));
+    }
+
+    let mut expected_inputs = artifact.input_dim;
+    for (index, layer) in artifact.layers.iter().enumerate() {
+        if layer.weights.is_empty() {
+            return Err(SolverError::InvalidState(format!(
+                "V-Net layer {index} has no weights"
+            )));
+        }
+        if layer.weights.len() != layer.biases.len() {
+            return Err(SolverError::InvalidState(format!(
+                "V-Net layer {index} output/bias mismatch: weights {}, biases {}",
+                layer.weights.len(),
+                layer.biases.len()
+            )));
+        }
+        for row in &layer.weights {
+            if row.len() != expected_inputs {
+                return Err(SolverError::InvalidState(format!(
+                    "V-Net layer {index} input mismatch: expected {expected_inputs}, actual {}",
+                    row.len()
+                )));
+            }
+        }
+        expected_inputs = layer.weights.len();
+    }
+
+    if expected_inputs != 1 {
+        return Err(SolverError::InvalidState(format!(
+            "V-Net artifact must produce one scalar output, got {expected_inputs}"
+        )));
+    }
+    Ok(())
+}
+
+fn apply_vnet_layer(inputs: &[f32], layer: &VNetLayerArtifact) -> SolverResult<Vec<f32>> {
+    let mut outputs = Vec::with_capacity(layer.weights.len());
+    for (row, bias) in layer.weights.iter().zip(layer.biases.iter()) {
+        if row.len() != inputs.len() {
+            return Err(SolverError::InvalidState(format!(
+                "V-Net layer runtime input mismatch: expected {}, actual {}",
+                row.len(),
+                inputs.len()
+            )));
+        }
+        let value = row
+            .iter()
+            .zip(inputs.iter())
+            .fold(*bias, |sum, (weight, input)| sum + weight * input);
+        outputs.push(apply_vnet_activation(value, layer.activation));
+    }
+    Ok(outputs)
+}
+
+fn apply_vnet_activation(value: f32, activation: VNetActivation) -> f32 {
+    match activation {
+        VNetActivation::Linear => value,
+        VNetActivation::Relu => value.max(0.0),
+        VNetActivation::Sigmoid => stable_sigmoid(value),
+    }
+}
+
+fn stable_sigmoid(value: f32) -> f32 {
+    if value >= 0.0 {
+        1.0 / (1.0 + (-value).exp())
+    } else {
+        let exp = value.exp();
+        exp / (1.0 + exp)
+    }
+}
+
 fn example_id(provenance: &VNetProvenance) -> String {
     let step = provenance
         .step_index
@@ -746,146 +1099,4 @@ const LOCATION_TABLEAU_HIDDEN_BASE: u8 = 10;
 const LOCATION_TABLEAU_FACE_UP_BASE: u8 = 20;
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::{
-        cards::{Rank, Suit},
-        core::{FoundationState, HiddenAssignments, VisibleState},
-        experiments::fast_benchmark,
-    };
-
-    fn won_full_state() -> FullState {
-        let mut visible = VisibleState::default();
-        let mut foundations = FoundationState::default();
-        for suit in [Suit::Clubs, Suit::Diamonds, Suit::Hearts, Suit::Spades] {
-            foundations.set_top_rank(suit, Some(Rank::King));
-        }
-        visible.foundations = foundations;
-        FullState::new(visible, HiddenAssignments::empty())
-    }
-
-    fn provenance(seed: DealSeed) -> VNetProvenance {
-        VNetProvenance {
-            source: VNetDataSource::DeterministicSolve,
-            preset_name: "unit".to_string(),
-            deal_seed: seed,
-            step_index: Some(0),
-            chosen_move: None,
-            planner_value: None,
-            terminal_won: Some(true),
-        }
-    }
-
-    #[test]
-    fn full_state_encoding_is_stable_for_same_deal() {
-        let runner = ExperimentRunner;
-        let first = runner.generate_deal(DealSeed(123)).unwrap();
-        let second = runner.generate_deal(DealSeed(123)).unwrap();
-
-        let first_encoding = VNetStateEncoding::from_full_state(&first.full_state).unwrap();
-        let second_encoding = VNetStateEncoding::from_full_state(&second.full_state).unwrap();
-
-        assert_eq!(first_encoding, second_encoding);
-        assert_eq!(first_encoding.card_locations.len(), Card::COUNT);
-        assert_eq!(first_encoding.card_positions.len(), Card::COUNT);
-        assert_eq!(first_encoding.shape.feature_count, 114);
-    }
-
-    #[test]
-    fn exported_example_shape_contains_label_and_encoding() {
-        let full = won_full_state();
-        let example = vnet_example_from_full_state(
-            &full,
-            VNetLabelMode::TerminalOutcome,
-            1.0,
-            provenance(DealSeed(1)),
-            DatasetSplit::Train,
-        )
-        .unwrap();
-
-        assert_eq!(example.label, 1.0);
-        assert_eq!(example.label_mode, VNetLabelMode::TerminalOutcome);
-        assert_eq!(example.encoded_state.foundation_tops, [13, 13, 13, 13]);
-        assert_eq!(example.encoded_state.flat_features.len(), 114);
-    }
-
-    #[test]
-    fn deterministic_solver_label_hook_uses_deterministic_mode() {
-        let full = won_full_state();
-        let example = vnet_example_from_deterministic_solve(
-            &full,
-            DeterministicSearchConfig::default(),
-            provenance(DealSeed(2)),
-            DatasetSplit::Validation,
-        )
-        .unwrap();
-
-        assert_eq!(example.split, DatasetSplit::Validation);
-        assert_eq!(example.label_mode, VNetLabelMode::DeterministicSolverValue);
-        assert_eq!(example.label, 1.0);
-    }
-
-    #[test]
-    fn split_strategy_is_reproducible() {
-        let strategy = DatasetSplitStrategy::SeedModulo {
-            modulo: 10,
-            validation_remainder: 1,
-            test_remainder: 2,
-        };
-
-        assert_eq!(
-            strategy.split_for_seed(DealSeed(21)).unwrap(),
-            DatasetSplit::Validation
-        );
-        assert_eq!(
-            strategy.split_for_seed(DealSeed(22)).unwrap(),
-            DatasetSplit::Test
-        );
-        assert_eq!(
-            strategy.split_for_seed(DealSeed(23)).unwrap(),
-            DatasetSplit::Train
-        );
-    }
-
-    #[test]
-    fn autoplay_dataset_export_is_reproducible_under_fixed_seed() {
-        let suite = BenchmarkSuite::from_base_seed("vnet-repro", 50, 1);
-        let preset = fast_benchmark();
-        let config = VNetExportConfig {
-            max_steps: Some(0),
-            ..VNetExportConfig::default()
-        };
-
-        let first = collect_vnet_examples_from_autoplay_suite(&suite, &preset, &config).unwrap();
-        let second = collect_vnet_examples_from_autoplay_suite(&suite, &preset, &config).unwrap();
-
-        assert_eq!(first, second);
-        assert_eq!(first.metadata.example_count, 1);
-        assert_eq!(first.examples.len(), 1);
-        assert_eq!(first.examples[0].provenance.deal_seed, DealSeed(50));
-    }
-
-    #[test]
-    fn jsonl_writer_emits_metadata_and_examples() {
-        let suite = BenchmarkSuite::from_base_seed("vnet-jsonl", 60, 1);
-        let preset = fast_benchmark();
-        let config = VNetExportConfig {
-            max_steps: Some(0),
-            ..VNetExportConfig::default()
-        };
-        let dataset = collect_vnet_examples_from_autoplay_suite(&suite, &preset, &config).unwrap();
-        let path = std::env::temp_dir().join(format!(
-            "solitaire-vnet-{}-{}.jsonl",
-            std::process::id(),
-            crate::VERSION
-        ));
-        let _ = std::fs::remove_file(&path);
-
-        VNetDatasetWriter::write_jsonl(&path, &dataset).unwrap();
-        let contents = std::fs::read_to_string(&path).unwrap();
-
-        assert!(contents.lines().next().unwrap().contains("\"metadata\""));
-        assert!(contents.contains("\"example\""));
-        let _ = std::fs::remove_file(path);
-    }
-}
+mod tests;

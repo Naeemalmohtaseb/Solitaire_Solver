@@ -10,19 +10,27 @@ use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
 
+mod parallel;
+mod support;
+#[cfg(test)]
+mod tests;
+
+use parallel::recommend_move_belief_uct_root_parallel;
+use support::{PlannerRng, StableHash};
+
 use crate::{
-    belief::{apply_belief_transition, sample_full_states, BeliefTransition, RevealFrontier},
+    belief::{apply_belief_transition, BeliefTransition, PreparedWorldSampler, RevealFrontier},
     closure::ClosureEngine,
     config::{DeterministicSolverConfig, SolverConfig},
     core::BeliefState,
     deterministic_solver::{
-        ordered_macro_moves, DeterministicSearchConfig, DeterministicSolver, DeterministicTtConfig,
-        EvaluatorWeights, SolveBudget, SolveOutcome,
+        ordered_macro_moves, DeterministicSearchConfig, DeterministicSearchStats,
+        DeterministicSolver, DeterministicTtConfig, EvaluatorWeights, SolveBudget, SolveOutcome,
     },
     error::{SolverError, SolverResult},
     late_exact::{LateExactEvaluationMode, LateExactEvaluator, LateExactResult},
     moves::MacroMove,
-    types::DealSeed,
+    types::{DealSeed, SessionId},
 };
 
 /// Leaf continuation mode used by the belief planner.
@@ -93,6 +101,19 @@ pub struct BeliefPlannerConfig {
     pub second_reveal_uncertainty_threshold: f64,
     /// Additional simulations reserved for selective second-reveal refinement.
     pub second_reveal_refinement_simulations: usize,
+    /// Enables microsecond timing breakdowns on planner hot paths.
+    pub enable_perf_timing: bool,
+    /// Enables independent root workers with end-of-search root-stat aggregation.
+    pub enable_root_parallel: bool,
+    /// Maximum number of independent root workers.
+    pub root_workers: usize,
+    /// Optional per-worker simulation budget. If unset, `simulation_budget` is
+    /// split across workers as evenly as possible.
+    pub worker_simulation_budget: Option<usize>,
+    /// Seed stride applied between independent root workers.
+    pub worker_seed_stride: u64,
+    /// Whether aggregated root statistics refresh confidence bounds after merge.
+    pub aggregate_confidence_stats: bool,
 }
 
 impl Default for BeliefPlannerConfig {
@@ -116,6 +137,12 @@ impl Default for BeliefPlannerConfig {
             second_reveal_gap_threshold: 0.03,
             second_reveal_uncertainty_threshold: 0.08,
             second_reveal_refinement_simulations: 16,
+            enable_perf_timing: false,
+            enable_root_parallel: false,
+            root_workers: 1,
+            worker_simulation_budget: None,
+            worker_seed_stride: 1_000_003,
+            aggregate_confidence_stats: true,
         }
     }
 }
@@ -128,6 +155,379 @@ impl BeliefPlannerConfig {
             max_depth: self.max_depth,
         }
     }
+}
+
+/// Stable structural identity for a belief state.
+///
+/// This is a lightweight continuation key, not a general belief-state
+/// transposition-table entry. It includes the visible state, exact stock/waste
+/// state, and unseen tableau card set.
+#[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct BeliefStateKey(pub u64);
+
+impl BeliefStateKey {
+    /// Builds a deterministic key from a belief state.
+    pub fn from_belief(belief: &BeliefState) -> Self {
+        let mut hash = StableHash::new(0x6275_6374_2d62_656c);
+        hash.write_usize(belief.hidden_card_count());
+
+        for top in belief.visible.foundations.top_ranks {
+            hash.write_u8(top.map_or(0, |rank| rank.value()));
+        }
+
+        for column in &belief.visible.columns {
+            hash.write_u8(column.hidden_count);
+            hash.write_usize(column.face_up.len());
+            for card in &column.face_up {
+                hash.write_u8(card.index());
+            }
+        }
+
+        let stock = &belief.visible.stock;
+        hash.write_usize(stock.ring_cards.len());
+        hash.write_usize(stock.stock_len);
+        hash.write_usize(stock.cursor.unwrap_or(usize::MAX));
+        hash.write_u8(stock.accessible_depth);
+        hash.write_u32(stock.pass_index);
+        hash.write_u32(stock.max_passes.unwrap_or(u32::MAX));
+        hash.write_u8(stock.draw_count);
+        for card in &stock.ring_cards {
+            hash.write_u8(card.index());
+        }
+
+        hash.write_usize(belief.unseen_card_count());
+        for card in belief.unseen_cards.iter() {
+            hash.write_u8(card.index());
+        }
+
+        Self(hash.finish())
+    }
+}
+
+/// Stable fingerprint for the planner/solver controls that affect a cached root.
+#[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct PlannerConfigFingerprint(pub u64);
+
+impl PlannerConfigFingerprint {
+    /// Builds a conservative fingerprint from the public planner inputs.
+    pub fn from_configs(
+        solver_config: &SolverConfig,
+        planner_config: &BeliefPlannerConfig,
+        backend_tag: Option<&str>,
+        preset_name: Option<&str>,
+    ) -> Self {
+        let mut hash = StableHash::new(0x7265_7573_652d_6366);
+        hash.write_str(backend_tag.unwrap_or(""));
+        hash.write_str(preset_name.unwrap_or(""));
+
+        hash.write_u64(solver_config.search.wall_clock_limit_ms);
+        hash.write_u64(solver_config.search.node_budget.unwrap_or(u64::MAX));
+        hash.write_u64(solver_config.search.rng_seed.unwrap_or(u64::MAX));
+        hash.write_usize(solver_config.search.root_workers);
+
+        let closure = solver_config.closure;
+        hash.write_u8(closure.max_corridor_steps);
+        hash.write_bool(closure.enable_forced_foundation_closure);
+        hash.write_bool(closure.enable_single_move_closure);
+        hash.write_bool(closure.enable_single_king_placement_closure);
+        hash.write_bool(closure.stop_on_reveal);
+        hash.write_bool(closure.stop_on_stock_pivot);
+        hash.write_bool(closure.debug_validate_each_step);
+
+        let deterministic = &solver_config.deterministic;
+        hash.write_u64(u64::from(deterministic.max_macro_depth));
+        hash.write_u64(deterministic.exact_node_budget);
+        hash.write_u64(deterministic.fast_eval_node_budget);
+        hash.write_bool(deterministic.enable_dominance_pruning);
+        hash.write_bool(deterministic.enable_foundation_retreats);
+        hash.write_bool(deterministic.enable_tt);
+        hash.write_usize(deterministic.tt_capacity);
+        hash.write_bool(deterministic.tt_store_approx);
+        hash.write_u8(match deterministic.leaf_eval_mode {
+            crate::ml::LeafEvaluationMode::Heuristic => 0,
+            crate::ml::LeafEvaluationMode::VNet => 1,
+        });
+        hash.write_bool(deterministic.vnet_inference.enable_vnet);
+        hash.write_u8(match deterministic.vnet_inference.backend {
+            crate::ml::VNetBackend::RustMlpJson => 0,
+        });
+        hash.write_str(
+            deterministic
+                .vnet_inference
+                .model_path
+                .as_ref()
+                .and_then(|path| path.to_str())
+                .unwrap_or(""),
+        );
+        hash.write_bool(deterministic.vnet_inference.fallback_to_heuristic);
+        hash.write_bool(deterministic.vnet_inference.batch_leaf_eval);
+
+        let late_exact = solver_config.late_exact;
+        hash.write_bool(late_exact.enabled);
+        hash.write_u8(late_exact.hidden_card_threshold);
+        hash.write_usize(late_exact.max_root_actions);
+        hash.write_u64(late_exact.assignment_budget.unwrap_or(u64::MAX));
+        hash.write_u8(match late_exact.evaluation_mode {
+            LateExactEvaluationMode::Exact => 0,
+            LateExactEvaluationMode::Bounded => 1,
+            LateExactEvaluationMode::Fast => 2,
+        });
+
+        hash.write_usize(planner_config.simulation_budget);
+        hash.write_u8(planner_config.max_depth);
+        hash.write_f64(planner_config.exploration_constant);
+        hash.write_usize(planner_config.leaf_world_samples);
+        hash.write_u8(match planner_config.leaf_eval_mode {
+            PlannerLeafEvalMode::Fast => 0,
+            PlannerLeafEvalMode::Bounded => 1,
+            PlannerLeafEvalMode::Exact => 2,
+        });
+        hash.write_u64(planner_config.rng_seed.0);
+        hash.write_bool(planner_config.enable_early_stop);
+        hash.write_usize(planner_config.min_simulations_before_stop);
+        hash.write_f64(planner_config.confidence_z);
+        hash.write_f64(planner_config.separation_margin);
+        hash.write_usize(planner_config.initial_screen_simulations);
+        hash.write_usize(planner_config.max_active_root_actions.unwrap_or(usize::MAX));
+        hash.write_f64(planner_config.drop_margin);
+        hash.write_bool(planner_config.enable_second_reveal_refinement);
+        hash.write_usize(planner_config.max_second_reveal_actions);
+        hash.write_f64(planner_config.second_reveal_gap_threshold);
+        hash.write_f64(planner_config.second_reveal_uncertainty_threshold);
+        hash.write_usize(planner_config.second_reveal_refinement_simulations);
+        hash.write_bool(planner_config.enable_perf_timing);
+        hash.write_bool(planner_config.enable_root_parallel);
+        hash.write_usize(planner_config.root_workers);
+        hash.write_usize(
+            planner_config
+                .worker_simulation_budget
+                .unwrap_or(usize::MAX),
+        );
+        hash.write_u64(planner_config.worker_seed_stride);
+        hash.write_bool(planner_config.aggregate_confidence_stats);
+
+        Self(hash.finish())
+    }
+}
+
+/// Context supplied when asking the planner to continue from a previous root.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlannerReuseContext {
+    /// Optional session id used to guard session-lineage reuse.
+    pub session_id: Option<SessionId>,
+    /// Move observed since the previous recommendation, if any.
+    pub applied_move: Option<MacroMove>,
+    /// Real reveal observed after `applied_move`, if any.
+    pub observed_reveal: Option<crate::cards::Card>,
+    /// Backend label, such as `belief_uct` or `belief_uct_late_exact`.
+    pub backend_tag: Option<String>,
+    /// Preset label used to build the configs, if known.
+    pub preset_name: Option<String>,
+}
+
+/// Reuse mode chosen for a recommendation request.
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ReuseOutcome {
+    /// No continuation was supplied.
+    ColdStart,
+    /// The current root matched a cached recommendation exactly.
+    CurrentRootCache,
+    /// The supplied move matched a cached deterministic child.
+    FollowedMove,
+    /// The supplied move and observed card matched a cached reveal child.
+    RevealChild,
+    /// The current belief matched a previously cached root by identity.
+    HashLookup,
+    /// Continuation was present but could not safely apply.
+    Fallback,
+    /// Continuation belonged to a different planner/solver configuration.
+    ConfigMismatch,
+}
+
+/// Diagnostics describing how continuation reuse was handled.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReuseDiagnostics {
+    /// Whether a previous continuation was inspected.
+    pub attempted: bool,
+    /// Whether any reusable cache metadata was matched safely.
+    pub succeeded: bool,
+    /// Reuse mode used for this request.
+    pub outcome: ReuseOutcome,
+    /// Whether the planner had to run a fresh search after inspecting reuse.
+    pub fallback: bool,
+    /// Current belief identity.
+    pub current_root_key: BeliefStateKey,
+    /// Previous root identity, if a continuation was supplied.
+    pub previous_root_key: Option<BeliefStateKey>,
+    /// Number of cached root actions reused or inspected.
+    pub reused_action_count: usize,
+    /// Number of cached action-stat records reused or inspected.
+    pub reused_stats_count: usize,
+    /// Number of cached reveal children matched or available for the path.
+    pub reveal_children_reused: usize,
+}
+
+impl ReuseDiagnostics {
+    fn cold(current_root_key: BeliefStateKey) -> Self {
+        Self {
+            attempted: false,
+            succeeded: false,
+            outcome: ReuseOutcome::ColdStart,
+            fallback: true,
+            current_root_key,
+            previous_root_key: None,
+            reused_action_count: 0,
+            reused_stats_count: 0,
+            reveal_children_reused: 0,
+        }
+    }
+}
+
+/// One cached reveal child reached by a root action.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CachedRevealChild {
+    /// Card observed at the reveal frontier.
+    pub revealed_card: crate::cards::Card,
+    /// Belief key after observing this card.
+    pub child_key: BeliefStateKey,
+}
+
+/// Cached child identities for one root action.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CachedActionChild {
+    /// Root action.
+    pub action: MacroMove,
+    /// Deterministic child key when the action does not reveal.
+    pub deterministic_child: Option<BeliefStateKey>,
+    /// Exact reveal children when the action reaches a root reveal frontier.
+    pub reveal_children: Vec<CachedRevealChild>,
+}
+
+/// Bounded cache of one previously searched root recommendation.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RootActionCache {
+    /// Belief key for the cached root.
+    pub root_key: BeliefStateKey,
+    /// Config fingerprint used when the cache was built.
+    pub config_fingerprint: PlannerConfigFingerprint,
+    /// Legal root action list in deterministic generation order.
+    pub candidate_actions: Vec<MacroMove>,
+    /// Child identities for each cached root action.
+    pub action_children: Vec<CachedActionChild>,
+    /// Full recommendation produced for this root.
+    pub recommendation: PlannerRecommendation,
+    /// Optional backend label.
+    pub backend_tag: Option<String>,
+    /// Optional preset label.
+    pub preset_name: Option<String>,
+}
+
+/// Cached recommendation payload used by callers that persist only one root.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CachedRecommendation {
+    /// Cached root analysis.
+    pub root_cache: RootActionCache,
+}
+
+/// Lightweight planner continuation carried across turns.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PlannerContinuation {
+    /// Optional session id for lineage checks.
+    pub session_id: Option<SessionId>,
+    /// Belief key for the most recently cached root.
+    pub current_root_key: BeliefStateKey,
+    /// Config fingerprint for all roots in this continuation.
+    pub config_fingerprint: PlannerConfigFingerprint,
+    /// Optional backend label.
+    pub backend_tag: Option<String>,
+    /// Optional preset label.
+    pub preset_name: Option<String>,
+    /// Most recent root cache.
+    pub root_cache: RootActionCache,
+    /// Small bounded list of older root caches for deviation/hash lookup.
+    pub recent_roots: Vec<RootActionCache>,
+    /// Maximum old roots retained.
+    pub max_recent_roots: usize,
+}
+
+impl PlannerContinuation {
+    const DEFAULT_RECENT_ROOT_LIMIT: usize = 8;
+
+    fn from_root_cache(
+        session_id: Option<SessionId>,
+        root_cache: RootActionCache,
+        max_recent_roots: usize,
+    ) -> Self {
+        Self {
+            session_id,
+            current_root_key: root_cache.root_key,
+            config_fingerprint: root_cache.config_fingerprint,
+            backend_tag: root_cache.backend_tag.clone(),
+            preset_name: root_cache.preset_name.clone(),
+            root_cache,
+            recent_roots: Vec::new(),
+            max_recent_roots,
+        }
+    }
+
+    /// Builds a continuation around a freshly produced root recommendation.
+    pub fn from_recommendation(
+        belief: &BeliefState,
+        solver_config: &SolverConfig,
+        planner_config: &BeliefPlannerConfig,
+        recommendation: PlannerRecommendation,
+        context: PlannerReuseContext,
+    ) -> SolverResult<Self> {
+        let fingerprint = PlannerConfigFingerprint::from_configs(
+            solver_config,
+            planner_config,
+            context.backend_tag.as_deref(),
+            context.preset_name.as_deref(),
+        );
+        let root_cache = build_root_action_cache(
+            belief,
+            solver_config,
+            planner_config,
+            fingerprint,
+            recommendation,
+            context.backend_tag,
+            context.preset_name,
+        )?;
+        Ok(Self::from_root_cache(
+            context.session_id,
+            root_cache,
+            Self::DEFAULT_RECENT_ROOT_LIMIT,
+        ))
+    }
+
+    fn record_root(&mut self, root_cache: RootActionCache) {
+        if self.root_cache.root_key != root_cache.root_key {
+            self.recent_roots.insert(0, self.root_cache.clone());
+        }
+        self.recent_roots
+            .retain(|cache| cache.root_key != root_cache.root_key);
+        self.recent_roots.truncate(self.max_recent_roots);
+        self.current_root_key = root_cache.root_key;
+        self.config_fingerprint = root_cache.config_fingerprint;
+        self.backend_tag = root_cache.backend_tag.clone();
+        self.preset_name = root_cache.preset_name.clone();
+        self.root_cache = root_cache;
+    }
+
+    fn all_roots(&self) -> impl Iterator<Item = &RootActionCache> {
+        std::iter::once(&self.root_cache).chain(self.recent_roots.iter())
+    }
+}
+
+/// Recommendation plus continuation metadata for the next turn.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ContinuationResult {
+    /// Planner recommendation.
+    pub recommendation: PlannerRecommendation,
+    /// Updated continuation cache to persist in a session.
+    pub continuation: PlannerContinuation,
+    /// Reuse diagnostics for this call.
+    pub reuse: ReuseDiagnostics,
 }
 
 /// Running root statistics for one planner action.
@@ -251,6 +651,12 @@ pub struct PlannerRecommendation {
     pub leaf_evaluations: u64,
     /// Deterministic solver nodes used at leaves.
     pub deterministic_nodes: u64,
+    /// V-Net inference calls used by deterministic leaf evaluation.
+    pub vnet_inferences: u64,
+    /// Leaf evaluations that requested V-Net but fell back to the heuristic.
+    pub vnet_fallbacks: u64,
+    /// Time spent inside V-Net inference, in microseconds.
+    pub vnet_inference_elapsed_us: u64,
     /// Closure steps applied while normalizing simulated belief states.
     pub closure_steps_applied: u64,
     /// Exact reveal-frontier branches enumerated during simulations.
@@ -273,6 +679,22 @@ pub struct PlannerRecommendation {
     pub late_exact_deterministic_nodes: u64,
     /// Late-exact evaluation time in milliseconds.
     pub late_exact_elapsed_ms: u64,
+    /// Time spent enumerating late-exact assignments, excluding per-action solver work.
+    pub late_exact_assignment_enumeration_elapsed_us: u64,
+    /// Time spent in belief transitions during planner simulations, in microseconds.
+    pub belief_transition_elapsed_us: u64,
+    /// Time spent expanding reveal frontiers during planner simulations, in microseconds.
+    pub reveal_expansion_elapsed_us: u64,
+    /// Time spent in planner leaf evaluation, including world sampling, in microseconds.
+    pub leaf_eval_elapsed_us: u64,
+    /// Time spent inside deterministic leaf solver calls, in microseconds.
+    pub deterministic_eval_elapsed_us: u64,
+    /// Whether the recommendation was produced by independent root-parallel workers.
+    pub root_parallel_used: bool,
+    /// Number of root workers that contributed to this recommendation.
+    pub root_parallel_workers: usize,
+    /// Simulations actually completed by each root worker, in worker-index order.
+    pub root_parallel_worker_simulations: Vec<usize>,
     /// Elapsed planner wall-clock time in milliseconds.
     pub elapsed_ms: u64,
 }
@@ -299,10 +721,158 @@ impl BeliefPlanner {
     pub fn recommend(&self, belief: &BeliefState) -> SolverResult<PlannerRecommendation> {
         recommend_move_belief_uct(belief, &self.solver_config, &self.planner_config)
     }
+
+    /// Recommends a move while carrying lightweight root-analysis reuse metadata.
+    pub fn recommend_with_reuse(
+        &self,
+        belief: &BeliefState,
+        continuation: Option<&PlannerContinuation>,
+        context: PlannerReuseContext,
+    ) -> SolverResult<ContinuationResult> {
+        recommend_move_belief_uct_with_reuse(
+            belief,
+            &self.solver_config,
+            &self.planner_config,
+            continuation,
+            context,
+        )
+    }
+}
+
+/// Recommends a root move while reusing bounded continuation metadata when safe.
+///
+/// This is intentionally lightweight. Exact current-root matches can return the
+/// cached recommendation immediately. Followed-move and reveal-child matches
+/// preserve and report the cached parent/root metadata, then run a fresh search
+/// for the new root unless that new root already exists in the small recent-root
+/// cache. Any config or state mismatch falls back to a cold planner call.
+pub fn recommend_move_belief_uct_with_reuse(
+    belief: &BeliefState,
+    solver_config: &SolverConfig,
+    planner_config: &BeliefPlannerConfig,
+    continuation: Option<&PlannerContinuation>,
+    context: PlannerReuseContext,
+) -> SolverResult<ContinuationResult> {
+    belief.validate_consistency_against_visible()?;
+
+    let current_key = BeliefStateKey::from_belief(belief);
+    let fingerprint = PlannerConfigFingerprint::from_configs(
+        solver_config,
+        planner_config,
+        context.backend_tag.as_deref(),
+        context.preset_name.as_deref(),
+    );
+
+    let mut diagnostics = ReuseDiagnostics::cold(current_key);
+
+    if let Some(continuation) = continuation {
+        diagnostics.attempted = true;
+        diagnostics.previous_root_key = Some(continuation.current_root_key);
+
+        let session_matches = continuation.session_id.is_none()
+            || context.session_id.is_none()
+            || continuation.session_id == context.session_id;
+        if !session_matches || continuation.config_fingerprint != fingerprint {
+            diagnostics.outcome = ReuseOutcome::ConfigMismatch;
+        } else if let Some(cache) = find_cached_root(
+            continuation,
+            current_key,
+            fingerprint,
+            belief,
+            solver_config,
+            planner_config,
+        )? {
+            let mut updated = continuation.clone();
+            updated.record_root(cache.clone());
+            diagnostics.succeeded = true;
+            diagnostics.fallback = false;
+            diagnostics.outcome = if cache.root_key == continuation.root_cache.root_key {
+                ReuseOutcome::CurrentRootCache
+            } else {
+                ReuseOutcome::HashLookup
+            };
+            diagnostics.reused_action_count = cache.candidate_actions.len();
+            diagnostics.reused_stats_count = cache.recommendation.action_stats.len();
+            diagnostics.reveal_children_reused = cache
+                .action_children
+                .iter()
+                .map(|child| child.reveal_children.len())
+                .sum();
+            return Ok(ContinuationResult {
+                recommendation: cache.recommendation,
+                continuation: updated,
+                reuse: diagnostics,
+            });
+        } else if let Some(path) = match_continuation_path(continuation, current_key, &context) {
+            diagnostics = path;
+        } else {
+            diagnostics.outcome = ReuseOutcome::Fallback;
+        }
+    }
+
+    let recommendation = recommend_move_belief_uct(belief, solver_config, planner_config)?;
+    let root_cache = build_root_action_cache(
+        belief,
+        solver_config,
+        planner_config,
+        fingerprint,
+        recommendation.clone(),
+        context.backend_tag.clone(),
+        context.preset_name.clone(),
+    )?;
+
+    let mut updated = continuation
+        .filter(|existing| {
+            existing.config_fingerprint == fingerprint
+                && (existing.session_id.is_none()
+                    || context.session_id.is_none()
+                    || existing.session_id == context.session_id)
+        })
+        .cloned()
+        .unwrap_or_else(|| {
+            PlannerContinuation::from_root_cache(
+                context.session_id,
+                root_cache.clone(),
+                PlannerContinuation::DEFAULT_RECENT_ROOT_LIMIT,
+            )
+        });
+    updated.session_id = context.session_id.or(updated.session_id);
+    updated.record_root(root_cache);
+
+    Ok(ContinuationResult {
+        recommendation,
+        continuation: updated,
+        reuse: diagnostics,
+    })
 }
 
 /// Recommends a root move with sparse UCT-style belief simulations.
 pub fn recommend_move_belief_uct(
+    belief: &BeliefState,
+    solver_config: &SolverConfig,
+    planner_config: &BeliefPlannerConfig,
+) -> SolverResult<PlannerRecommendation> {
+    if planner_config.enable_root_parallel && planner_config.root_workers.max(1) > 1 {
+        recommend_move_belief_uct_parallel(belief, solver_config, planner_config)
+    } else {
+        recommend_move_belief_uct_single_worker(belief, solver_config, planner_config)
+    }
+}
+
+/// Recommends a root move by running independent workers from the same belief
+/// root and merging only root action statistics.
+pub fn recommend_move_belief_uct_parallel(
+    belief: &BeliefState,
+    solver_config: &SolverConfig,
+    planner_config: &BeliefPlannerConfig,
+) -> SolverResult<PlannerRecommendation> {
+    if planner_config.root_workers.max(1) <= 1 {
+        return recommend_move_belief_uct_single_worker(belief, solver_config, planner_config);
+    }
+    recommend_move_belief_uct_root_parallel(belief, solver_config, planner_config)
+}
+
+fn recommend_move_belief_uct_single_worker(
     belief: &BeliefState,
     solver_config: &SolverConfig,
     planner_config: &BeliefPlannerConfig,
@@ -326,6 +896,9 @@ pub fn recommend_move_belief_uct(
             no_legal_moves: true,
             leaf_evaluations: 0,
             deterministic_nodes: 0,
+            vnet_inferences: 0,
+            vnet_fallbacks: 0,
+            vnet_inference_elapsed_us: 0,
             closure_steps_applied: 0,
             reveal_branches_expanded: 0,
             reveal_frontier_children_covered: 0,
@@ -337,6 +910,14 @@ pub fn recommend_move_belief_uct(
             late_exact_assignments_pruned: 0,
             late_exact_deterministic_nodes: 0,
             late_exact_elapsed_ms: 0,
+            late_exact_assignment_enumeration_elapsed_us: 0,
+            belief_transition_elapsed_us: 0,
+            reveal_expansion_elapsed_us: 0,
+            leaf_eval_elapsed_us: 0,
+            deterministic_eval_elapsed_us: 0,
+            root_parallel_used: false,
+            root_parallel_workers: 1,
+            root_parallel_worker_simulations: vec![0],
             elapsed_ms: started.elapsed().as_millis() as u64,
         });
     }
@@ -354,6 +935,9 @@ pub fn recommend_move_belief_uct(
             no_legal_moves: false,
             leaf_evaluations: 0,
             deterministic_nodes: 0,
+            vnet_inferences: 0,
+            vnet_fallbacks: 0,
+            vnet_inference_elapsed_us: 0,
             closure_steps_applied: 0,
             reveal_branches_expanded: 0,
             reveal_frontier_children_covered: 0,
@@ -365,6 +949,14 @@ pub fn recommend_move_belief_uct(
             late_exact_assignments_pruned: 0,
             late_exact_deterministic_nodes: 0,
             late_exact_elapsed_ms: 0,
+            late_exact_assignment_enumeration_elapsed_us: 0,
+            belief_transition_elapsed_us: 0,
+            reveal_expansion_elapsed_us: 0,
+            leaf_eval_elapsed_us: 0,
+            deterministic_eval_elapsed_us: 0,
+            root_parallel_used: false,
+            root_parallel_workers: 1,
+            root_parallel_worker_simulations: vec![0],
             elapsed_ms: started.elapsed().as_millis() as u64,
         });
     }
@@ -380,9 +972,15 @@ pub fn recommend_move_belief_uct(
         ));
     }
 
-    let solver = DeterministicSolver::new(deterministic_config);
+    let solver = DeterministicSolver::new_with_vnet_config(
+        deterministic_config,
+        &solver_config.deterministic.vnet_inference,
+    );
     let mut rng = PlannerRng::new(planner_config.rng_seed.0);
-    let mut counters = PlannerCounters::default();
+    let mut counters = PlannerCounters {
+        timing_enabled: planner_config.enable_perf_timing,
+        ..PlannerCounters::default()
+    };
     let mut root_actions = candidates
         .into_iter()
         .map(RootActionState::new)
@@ -486,6 +1084,9 @@ pub fn recommend_move_belief_uct(
         no_legal_moves: false,
         leaf_evaluations: counters.leaf_evaluations,
         deterministic_nodes: counters.deterministic_nodes,
+        vnet_inferences: counters.vnet_inferences,
+        vnet_fallbacks: counters.vnet_fallbacks,
+        vnet_inference_elapsed_us: counters.vnet_inference_elapsed_us,
         closure_steps_applied: counters.closure_steps_applied,
         reveal_branches_expanded: counters.reveal_branches_expanded,
         reveal_frontier_children_covered,
@@ -497,8 +1098,177 @@ pub fn recommend_move_belief_uct(
         late_exact_assignments_pruned: late_exact_result.assignments_pruned,
         late_exact_deterministic_nodes: late_exact_result.deterministic_nodes,
         late_exact_elapsed_ms: late_exact_result.elapsed_ms,
+        late_exact_assignment_enumeration_elapsed_us: late_exact_result
+            .assignment_enumeration_elapsed_us,
+        belief_transition_elapsed_us: counters.belief_transition_elapsed_us,
+        reveal_expansion_elapsed_us: counters.reveal_expansion_elapsed_us,
+        leaf_eval_elapsed_us: counters.leaf_eval_elapsed_us,
+        deterministic_eval_elapsed_us: counters.deterministic_eval_elapsed_us,
+        root_parallel_used: false,
+        root_parallel_workers: 1,
+        root_parallel_worker_simulations: vec![simulations_run],
         elapsed_ms: started.elapsed().as_millis() as u64,
     })
+}
+
+fn build_root_action_cache(
+    belief: &BeliefState,
+    solver_config: &SolverConfig,
+    planner_config: &BeliefPlannerConfig,
+    fingerprint: PlannerConfigFingerprint,
+    recommendation: PlannerRecommendation,
+    backend_tag: Option<String>,
+    preset_name: Option<String>,
+) -> SolverResult<RootActionCache> {
+    let root_key = BeliefStateKey::from_belief(belief);
+    let deterministic_config = deterministic_search_config(solver_config, planner_config);
+    let candidate_actions = ordered_macro_moves(&belief.visible, deterministic_config);
+    let mut action_children = Vec::with_capacity(candidate_actions.len());
+
+    for action in &candidate_actions {
+        let transition = apply_belief_transition(belief, action.atomic)?;
+        let child = match transition {
+            BeliefTransition::Deterministic { belief, .. } => CachedActionChild {
+                action: action.clone(),
+                deterministic_child: Some(BeliefStateKey::from_belief(&belief)),
+                reveal_children: Vec::new(),
+            },
+            BeliefTransition::Reveal { frontier } => CachedActionChild {
+                action: action.clone(),
+                deterministic_child: None,
+                reveal_children: frontier
+                    .outcomes
+                    .iter()
+                    .map(|outcome| CachedRevealChild {
+                        revealed_card: outcome.revealed_card,
+                        child_key: BeliefStateKey::from_belief(&outcome.belief),
+                    })
+                    .collect(),
+            },
+        };
+        action_children.push(child);
+    }
+
+    Ok(RootActionCache {
+        root_key,
+        config_fingerprint: fingerprint,
+        candidate_actions,
+        action_children,
+        recommendation,
+        backend_tag,
+        preset_name,
+    })
+}
+
+fn find_cached_root(
+    continuation: &PlannerContinuation,
+    current_key: BeliefStateKey,
+    fingerprint: PlannerConfigFingerprint,
+    belief: &BeliefState,
+    solver_config: &SolverConfig,
+    planner_config: &BeliefPlannerConfig,
+) -> SolverResult<Option<RootActionCache>> {
+    for cache in continuation.all_roots() {
+        if cache.root_key == current_key
+            && cache.config_fingerprint == fingerprint
+            && cached_action_surface_matches(cache, belief, solver_config, planner_config)
+        {
+            return Ok(Some(cache.clone()));
+        }
+    }
+    Ok(None)
+}
+
+fn cached_action_surface_matches(
+    cache: &RootActionCache,
+    belief: &BeliefState,
+    solver_config: &SolverConfig,
+    planner_config: &BeliefPlannerConfig,
+) -> bool {
+    let deterministic_config = deterministic_search_config(solver_config, planner_config);
+    ordered_macro_moves(&belief.visible, deterministic_config) == cache.candidate_actions
+}
+
+fn match_continuation_path(
+    continuation: &PlannerContinuation,
+    current_key: BeliefStateKey,
+    context: &PlannerReuseContext,
+) -> Option<ReuseDiagnostics> {
+    let mut diagnostics = ReuseDiagnostics {
+        attempted: true,
+        succeeded: false,
+        outcome: ReuseOutcome::Fallback,
+        fallback: true,
+        current_root_key: current_key,
+        previous_root_key: Some(continuation.current_root_key),
+        reused_action_count: 0,
+        reused_stats_count: 0,
+        reveal_children_reused: 0,
+    };
+
+    let applied_move = context.applied_move.as_ref()?;
+    let child = continuation
+        .root_cache
+        .action_children
+        .iter()
+        .find(|child| child.action == *applied_move)?;
+
+    diagnostics.reused_action_count = continuation.root_cache.candidate_actions.len();
+    diagnostics.reused_stats_count = continuation.root_cache.recommendation.action_stats.len();
+
+    if let Some(revealed_card) = context.observed_reveal {
+        let matching_child = child.reveal_children.iter().find(|reveal| {
+            reveal.revealed_card == revealed_card && reveal.child_key == current_key
+        });
+        if matching_child.is_some() {
+            diagnostics.succeeded = true;
+            diagnostics.outcome = ReuseOutcome::RevealChild;
+            diagnostics.reveal_children_reused = child.reveal_children.len();
+            return Some(diagnostics);
+        }
+        return Some(diagnostics);
+    }
+
+    if child.deterministic_child == Some(current_key) {
+        diagnostics.succeeded = true;
+        diagnostics.outcome = ReuseOutcome::FollowedMove;
+        return Some(diagnostics);
+    }
+
+    if child
+        .reveal_children
+        .iter()
+        .any(|reveal| reveal.child_key == current_key)
+    {
+        diagnostics.succeeded = true;
+        diagnostics.outcome = ReuseOutcome::HashLookup;
+        diagnostics.reveal_children_reused = child.reveal_children.len();
+        return Some(diagnostics);
+    }
+
+    Some(diagnostics)
+}
+
+fn timed_belief_transition(
+    belief: &BeliefState,
+    action: crate::moves::AtomicMove,
+    counters: &mut PlannerCounters,
+) -> SolverResult<BeliefTransition> {
+    if !counters.timing_enabled {
+        return apply_belief_transition(belief, action);
+    }
+
+    let started = Instant::now();
+    let transition = apply_belief_transition(belief, action)?;
+    let elapsed = elapsed_micros(started);
+    counters.belief_transition_elapsed_us = counters
+        .belief_transition_elapsed_us
+        .saturating_add(elapsed);
+    if matches!(transition, BeliefTransition::Reveal { .. }) {
+        counters.reveal_expansion_elapsed_us =
+            counters.reveal_expansion_elapsed_us.saturating_add(elapsed);
+    }
+    Ok(transition)
 }
 
 fn simulate_root_action(
@@ -526,9 +1296,9 @@ fn simulate_root_action(
         if let Some(covered) = root_action.covered_reveal_children.get_mut(child_index) {
             *covered = true;
         }
-        let child = frontier.outcomes[child_index].belief.clone();
+        let child = &frontier.outcomes[child_index].belief;
         let mut result = simulate_belief(
-            &child,
+            child,
             1,
             rng,
             solver,
@@ -540,7 +1310,7 @@ fn simulate_root_action(
         Ok(result)
     } else {
         if root_action.deterministic_child.is_none() {
-            match apply_belief_transition(root_belief, root_action.stats.action.atomic)? {
+            match timed_belief_transition(root_belief, root_action.stats.action.atomic, counters)? {
                 BeliefTransition::Deterministic { belief, .. } => {
                     root_action.deterministic_child = Some(belief);
                 }
@@ -564,15 +1334,11 @@ fn simulate_root_action(
             }
         }
 
-        let child = root_action
-            .deterministic_child
-            .as_ref()
-            .ok_or_else(|| {
-                SolverError::InvalidState("missing cached deterministic root child".to_string())
-            })?
-            .clone();
+        let child = root_action.deterministic_child.as_ref().ok_or_else(|| {
+            SolverError::InvalidState("missing cached deterministic root child".to_string())
+        })?;
         simulate_belief(
-            &child,
+            child,
             1,
             rng,
             solver,
@@ -592,7 +1358,7 @@ fn ensure_root_reveal_frontier(
         return Ok(0);
     }
 
-    match apply_belief_transition(root_belief, root_action.stats.action.atomic)? {
+    match timed_belief_transition(root_belief, root_action.stats.action.atomic, counters)? {
         BeliefTransition::Reveal { frontier } => {
             let branch_count = frontier.len();
             counters.reveal_branches_expanded += branch_count as u64;
@@ -658,7 +1424,7 @@ fn simulate_action(
     planner_config: &BeliefPlannerConfig,
     counters: &mut PlannerCounters,
 ) -> SolverResult<SimulationResult> {
-    match apply_belief_transition(belief, action.atomic)? {
+    match timed_belief_transition(belief, action.atomic, counters)? {
         BeliefTransition::Deterministic { belief, .. } => simulate_belief(
             &belief,
             depth.saturating_add(1),
@@ -714,47 +1480,60 @@ fn evaluate_leaf_belief(
     planner_config: &BeliefPlannerConfig,
     counters: &mut PlannerCounters,
 ) -> SolverResult<SimulationResult> {
-    let samples = sample_full_states(
-        belief,
-        planner_config.leaf_world_samples,
-        DealSeed(rng.next_u64()),
-    )?;
+    let started = counters.timing_enabled.then(Instant::now);
+    let mut sampler = PreparedWorldSampler::new(belief, DealSeed(rng.next_u64()))?;
 
     let mut value_sum = 0.0f32;
-    for sample in &samples {
+    for _ in 0..planner_config.leaf_world_samples {
+        let full_state = sampler.sample_full_state()?;
         counters.leaf_evaluations += 1;
+        let deterministic_started = counters.timing_enabled.then(Instant::now);
         let leaf = match planner_config.leaf_eval_mode {
             PlannerLeafEvalMode::Fast => {
-                let result = solver.evaluate_fast(&sample.full_state)?;
+                let result = solver.evaluate_fast(&full_state)?;
                 counters.deterministic_nodes += result.stats.nodes_expanded;
+                counters.record_vnet_stats(&result.stats);
                 LeafValue {
                     value: result.value,
                     outcome: SolveOutcome::Unknown,
                 }
             }
             PlannerLeafEvalMode::Bounded => {
-                let result = solver.solve_bounded(&sample.full_state)?;
+                let result = solver.solve_bounded(&full_state)?;
                 counters.deterministic_nodes += result.stats.nodes_expanded;
+                counters.record_vnet_stats(&result.stats);
                 LeafValue {
                     value: result.estimated_value,
                     outcome: result.outcome,
                 }
             }
             PlannerLeafEvalMode::Exact => {
-                let result = solver.solve_exact(&sample.full_state)?;
+                let result = solver.solve_exact(&full_state)?;
                 counters.deterministic_nodes += result.stats.nodes_expanded;
+                counters.record_vnet_stats(&result.stats);
                 LeafValue {
                     value: result.value,
                     outcome: result.outcome,
                 }
             }
         };
+        if let Some(deterministic_started) = deterministic_started {
+            counters.deterministic_eval_elapsed_us = counters
+                .deterministic_eval_elapsed_us
+                .saturating_add(elapsed_micros(deterministic_started));
+        }
         let _outcome = leaf.outcome;
         value_sum += leaf.value;
     }
 
+    if let Some(started) = started {
+        counters.leaf_eval_elapsed_us = counters
+            .leaf_eval_elapsed_us
+            .saturating_add(elapsed_micros(started));
+    }
+
     Ok(SimulationResult::terminal(
-        value_sum / samples.len().max(1) as f32,
+        value_sum / planner_config.leaf_world_samples.max(1) as f32,
     ))
 }
 
@@ -1043,6 +1822,7 @@ fn run_late_exact_if_eligible(
             action_stats: Vec::new(),
             deterministic_nodes: 0,
             elapsed_ms: 0,
+            assignment_enumeration_elapsed_us: 0,
         });
     }
 
@@ -1064,6 +1844,7 @@ fn run_late_exact_if_eligible(
             action_stats: Vec::new(),
             deterministic_nodes: 0,
             elapsed_ms: 0,
+            assignment_enumeration_elapsed_us: 0,
         });
     }
 
@@ -1137,6 +1918,10 @@ fn sample_reveal_outcome<'a>(
     })
 }
 
+fn elapsed_micros(started: Instant) -> u64 {
+    started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64
+}
+
 fn deterministic_search_config(
     solver_config: &SolverConfig,
     planner_config: &BeliefPlannerConfig,
@@ -1171,6 +1956,7 @@ fn deterministic_search_config_from_parts(
             capacity: deterministic.tt_capacity,
             store_approx: deterministic.tt_store_approx,
         },
+        leaf_eval_mode: deterministic.leaf_eval_mode,
     }
 }
 
@@ -1256,10 +2042,28 @@ impl RootActionState {
 
 #[derive(Debug, Copy, Clone, Default, PartialEq, Eq)]
 struct PlannerCounters {
+    timing_enabled: bool,
     leaf_evaluations: u64,
     deterministic_nodes: u64,
+    vnet_inferences: u64,
+    vnet_fallbacks: u64,
+    vnet_inference_elapsed_us: u64,
     closure_steps_applied: u64,
     reveal_branches_expanded: u64,
+    belief_transition_elapsed_us: u64,
+    reveal_expansion_elapsed_us: u64,
+    leaf_eval_elapsed_us: u64,
+    deterministic_eval_elapsed_us: u64,
+}
+
+impl PlannerCounters {
+    fn record_vnet_stats(&mut self, stats: &DeterministicSearchStats) {
+        self.vnet_inferences = self.vnet_inferences.saturating_add(stats.vnet_inferences);
+        self.vnet_fallbacks = self.vnet_fallbacks.saturating_add(stats.vnet_fallbacks);
+        self.vnet_inference_elapsed_us = self
+            .vnet_inference_elapsed_us
+            .saturating_add(stats.vnet_inference_elapsed_us);
+    }
 }
 
 #[derive(Debug, Copy, Clone, PartialEq)]
@@ -1281,424 +2085,4 @@ impl SimulationResult {
 struct LeafValue {
     value: f32,
     outcome: SolveOutcome,
-}
-
-#[derive(Debug, Copy, Clone, PartialEq, Eq)]
-struct PlannerRng {
-    state: u64,
-}
-
-impl PlannerRng {
-    const fn new(seed: u64) -> Self {
-        Self { state: seed }
-    }
-
-    fn next_u64(&mut self) -> u64 {
-        self.state = self.state.wrapping_add(0x9e37_79b9_7f4a_7c15);
-        let mut value = self.state;
-        value = (value ^ (value >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
-        value = (value ^ (value >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
-        value ^ (value >> 31)
-    }
-
-    fn next_bounded(&mut self, upper_exclusive: usize) -> usize {
-        debug_assert!(upper_exclusive > 0);
-        (self.next_u64() % upper_exclusive as u64) as usize
-    }
-
-    fn next_f64(&mut self) -> f64 {
-        let bits = self.next_u64() >> 11;
-        bits as f64 / ((1u64 << 53) as f64)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::{
-        belief::apply_belief_transition,
-        cards::Card,
-        core::{TableauColumn, UnseenCardSet, VisibleState},
-        moves::{AtomicMove, MacroMoveKind},
-        stock::CyclicStockState,
-        types::ColumnId,
-    };
-
-    fn col(index: u8) -> ColumnId {
-        ColumnId::new(index).unwrap()
-    }
-
-    fn card(text: &str) -> Card {
-        text.parse().unwrap()
-    }
-
-    fn stock_with_all_except(excluded: &[Card]) -> CyclicStockState {
-        let mut cards = Vec::new();
-        for index in 0..Card::COUNT {
-            let card = Card::new(index as u8).unwrap();
-            if !excluded.contains(&card) {
-                cards.push(card);
-            }
-        }
-        CyclicStockState::new(cards, None, 0, None, 3)
-    }
-
-    fn no_move_belief() -> BeliefState {
-        let cards = (0..Card::COUNT)
-            .map(|index| Card::new(index as u8).unwrap())
-            .collect();
-        let mut visible = VisibleState::default();
-        visible.stock = CyclicStockState::from_parts(cards, 0, 0, 0, Some(0), 3);
-        BeliefState::new(visible, UnseenCardSet::empty())
-    }
-
-    fn single_legal_belief() -> BeliefState {
-        let cards = (0..Card::COUNT)
-            .map(|index| Card::new(index as u8).unwrap())
-            .collect();
-        let mut visible = VisibleState::default();
-        visible.stock = CyclicStockState::new(cards, None, 0, None, 3);
-        BeliefState::new(visible, UnseenCardSet::empty())
-    }
-
-    fn reveal_belief() -> BeliefState {
-        let hidden_cards = [card("Ac"), card("2c")];
-        let seven = card("7s");
-        let eight = card("8h");
-        let mut visible = VisibleState::default();
-        visible.columns[0] = TableauColumn::new(2, vec![seven]);
-        visible.columns[1] = TableauColumn::new(0, vec![eight]);
-        visible.stock = stock_with_all_except(&[hidden_cards[0], hidden_cards[1], seven, eight]);
-        BeliefState::new(
-            visible,
-            UnseenCardSet::from_cards(hidden_cards).expect("unique unseen cards"),
-        )
-    }
-
-    fn nonreveal_belief() -> BeliefState {
-        let hidden = card("Ah");
-        let seven = card("7s");
-        let six = card("6h");
-        let mut visible = VisibleState::default();
-        visible.columns[0] = TableauColumn::new(0, vec![seven]);
-        visible.columns[1] = TableauColumn::new(0, vec![six]);
-        visible.columns[2] = TableauColumn::new(1, Vec::new());
-        visible.stock = stock_with_all_except(&[hidden, seven, six]);
-        BeliefState::new(
-            visible,
-            UnseenCardSet::from_cards([hidden]).expect("unique unseen card"),
-        )
-    }
-
-    fn solver_config() -> SolverConfig {
-        let mut config = SolverConfig::default();
-        config.deterministic.fast_eval_node_budget = 128;
-        config.deterministic.exact_node_budget = 256;
-        config.deterministic.max_macro_depth = 4;
-        config.deterministic.enable_tt = false;
-        config
-    }
-
-    fn planner_config(seed: u64) -> BeliefPlannerConfig {
-        BeliefPlannerConfig {
-            simulation_budget: 6,
-            max_depth: 1,
-            exploration_constant: 1.0,
-            leaf_world_samples: 1,
-            leaf_eval_mode: PlannerLeafEvalMode::Fast,
-            rng_seed: DealSeed(seed),
-            enable_early_stop: false,
-            initial_screen_simulations: 0,
-            max_active_root_actions: None,
-            enable_second_reveal_refinement: false,
-            ..BeliefPlannerConfig::default()
-        }
-    }
-
-    #[test]
-    fn planner_returns_only_legal_moves() {
-        let belief = reveal_belief();
-        let config = solver_config();
-        let planner = planner_config(7);
-        let recommendation = recommend_move_belief_uct(&belief, &config, &planner).unwrap();
-        let legal = ordered_macro_moves(
-            &belief.visible,
-            deterministic_search_config(&config, &planner),
-        );
-
-        assert!(legal
-            .iter()
-            .any(|legal| Some(legal) == recommendation.best_move.as_ref()));
-    }
-
-    #[test]
-    fn single_legal_move_returns_immediately() {
-        let belief = single_legal_belief();
-        let recommendation =
-            recommend_move_belief_uct(&belief, &solver_config(), &planner_config(11)).unwrap();
-
-        assert_eq!(recommendation.simulations_run, 0);
-        assert!(matches!(
-            recommendation.best_move.map(|action| action.kind),
-            Some(MacroMoveKind::AdvanceStock)
-        ));
-        assert_eq!(recommendation.action_stats.len(), 1);
-    }
-
-    #[test]
-    fn no_legal_moves_returns_no_move_result() {
-        let belief = no_move_belief();
-        let recommendation =
-            recommend_move_belief_uct(&belief, &solver_config(), &planner_config(12)).unwrap();
-
-        assert!(recommendation.no_legal_moves);
-        assert!(recommendation.best_move.is_none());
-        assert!(recommendation.action_stats.is_empty());
-    }
-
-    #[test]
-    fn reveal_actions_use_reveal_frontier_logic() {
-        let belief = reveal_belief();
-        let recommendation =
-            recommend_move_belief_uct(&belief, &solver_config(), &planner_config(13)).unwrap();
-
-        let reveal_stats = recommendation
-            .action_stats
-            .iter()
-            .find(|stats| stats.action.semantics.causes_reveal)
-            .expect("root should contain a reveal action");
-
-        assert!(reveal_stats.visits > 0);
-        assert!(reveal_stats.reveal_branches_expanded >= belief.unseen_card_count() as u64);
-        assert!(recommendation.reveal_branches_expanded >= belief.unseen_card_count() as u64);
-    }
-
-    #[test]
-    fn deterministic_non_reveal_transition_preserves_unseen_set() {
-        let belief = nonreveal_belief();
-        let transition = apply_belief_transition(
-            &belief,
-            AtomicMove::TableauToTableau {
-                src: col(1),
-                dest: col(0),
-                run_start: 0,
-            },
-        )
-        .unwrap();
-
-        let BeliefTransition::Deterministic { belief: child, .. } = transition else {
-            panic!("expected deterministic transition");
-        };
-        assert_eq!(child.unseen_cards, belief.unseen_cards);
-    }
-
-    #[test]
-    fn same_seed_gives_reproducible_planner_output() {
-        let belief = reveal_belief();
-        let config = solver_config();
-        let planner = planner_config(21);
-
-        let first = recommend_move_belief_uct(&belief, &config, &planner).unwrap();
-        let second = recommend_move_belief_uct(&belief, &config, &planner).unwrap();
-
-        assert_eq!(first.best_move, second.best_move);
-        assert_eq!(first.best_value, second.best_value);
-        assert_eq!(first.action_stats, second.action_stats);
-        assert_eq!(first.simulations_run, second.simulations_run);
-    }
-
-    #[test]
-    fn planner_does_not_mutate_input_belief_state() {
-        let belief = reveal_belief();
-        let before = belief.clone();
-
-        let _recommendation =
-            recommend_move_belief_uct(&belief, &solver_config(), &planner_config(31)).unwrap();
-
-        assert_eq!(belief, before);
-    }
-
-    #[test]
-    fn root_stats_accumulate_one_visit_per_simulation() {
-        let belief = reveal_belief();
-        let planner = planner_config(44);
-        let recommendation =
-            recommend_move_belief_uct(&belief, &solver_config(), &planner).unwrap();
-
-        let visits = recommendation
-            .action_stats
-            .iter()
-            .map(|stats| stats.visits)
-            .sum::<usize>();
-
-        assert_eq!(recommendation.simulations_run, planner.simulation_budget);
-        assert_eq!(visits, planner.simulation_budget);
-    }
-
-    #[test]
-    fn early_stopping_respects_minimum_sample_threshold() {
-        let belief = reveal_belief();
-        let config = solver_config();
-        let planner = planner_config(55);
-        let actions = ordered_macro_moves(
-            &belief.visible,
-            deterministic_search_config(&config, &planner),
-        );
-        let mut root_actions = vec![
-            RootActionState::new(actions[0].clone()),
-            RootActionState::new(actions[1].clone()),
-        ];
-
-        for _ in 0..3 {
-            root_actions[0].stats.record(1.0, 0);
-            root_actions[1].stats.record(0.0, 0);
-        }
-
-        let stop_config = BeliefPlannerConfig {
-            enable_early_stop: true,
-            min_simulations_before_stop: 8,
-            confidence_z: 0.0,
-            separation_margin: 0.0,
-            ..planner
-        };
-
-        assert!(!should_stop_early(&root_actions, 7, &stop_config));
-        assert!(should_stop_early(&root_actions, 8, &stop_config));
-    }
-
-    #[test]
-    fn action_narrowing_never_removes_only_legal_move() {
-        let belief = single_legal_belief();
-        let planner = BeliefPlannerConfig {
-            initial_screen_simulations: 1,
-            max_active_root_actions: Some(1),
-            drop_margin: 0.0,
-            ..planner_config(56)
-        };
-        let recommendation =
-            recommend_move_belief_uct(&belief, &solver_config(), &planner).unwrap();
-
-        assert_eq!(recommendation.action_stats.len(), 1);
-        assert_eq!(recommendation.actions_narrowed_out, 0);
-        assert_eq!(recommendation.active_root_actions, 1);
-    }
-
-    #[test]
-    fn reveal_root_actions_cover_exact_frontier_children_fairly() {
-        let belief = reveal_belief();
-        let planner = BeliefPlannerConfig {
-            simulation_budget: 4,
-            ..planner_config(57)
-        };
-        let recommendation =
-            recommend_move_belief_uct(&belief, &solver_config(), &planner).unwrap();
-        let reveal_stats = recommendation
-            .action_stats
-            .iter()
-            .find(|stats| stats.action.semantics.causes_reveal)
-            .expect("root should contain reveal action");
-
-        assert_eq!(
-            reveal_stats.reveal_frontier_children,
-            belief.unseen_card_count()
-        );
-        assert_eq!(
-            reveal_stats.reveal_frontier_children_covered,
-            belief.unseen_card_count()
-        );
-        assert_eq!(
-            recommendation.reveal_frontier_children_covered,
-            belief.unseen_card_count() as u64
-        );
-    }
-
-    #[test]
-    fn second_reveal_refinement_runs_only_for_close_enabled_reveal_contenders() {
-        let belief = reveal_belief();
-        let enabled = BeliefPlannerConfig {
-            simulation_budget: 4,
-            enable_second_reveal_refinement: true,
-            max_second_reveal_actions: 2,
-            second_reveal_gap_threshold: 1.0,
-            second_reveal_uncertainty_threshold: 2.0,
-            second_reveal_refinement_simulations: 3,
-            ..planner_config(58)
-        };
-        let enabled_result =
-            recommend_move_belief_uct(&belief, &solver_config(), &enabled).unwrap();
-
-        assert!(enabled_result.second_reveal_refinement_ran);
-        assert_eq!(enabled_result.second_reveal_simulations_run, 3);
-        assert_eq!(
-            enabled_result.simulations_run,
-            enabled.simulation_budget + 3
-        );
-        assert_eq!(
-            enabled_result
-                .action_stats
-                .iter()
-                .map(|stats| stats.second_reveal_refinement_visits)
-                .sum::<usize>(),
-            3
-        );
-
-        let disabled_by_threshold = BeliefPlannerConfig {
-            simulation_budget: 4,
-            enable_second_reveal_refinement: true,
-            max_second_reveal_actions: 2,
-            second_reveal_gap_threshold: -1.0,
-            second_reveal_uncertainty_threshold: 2.0,
-            second_reveal_refinement_simulations: 3,
-            ..planner_config(59)
-        };
-        let disabled_result =
-            recommend_move_belief_uct(&belief, &solver_config(), &disabled_by_threshold).unwrap();
-
-        assert!(!disabled_result.second_reveal_refinement_ran);
-        assert_eq!(disabled_result.second_reveal_simulations_run, 0);
-        assert_eq!(
-            disabled_result.simulations_run,
-            disabled_by_threshold.simulation_budget
-        );
-    }
-
-    #[test]
-    fn planner_uses_late_exact_for_eligible_top_actions() {
-        let belief = reveal_belief();
-        let mut solver = solver_config();
-        solver.late_exact.hidden_card_threshold = 2;
-        solver.late_exact.max_root_actions = 2;
-        solver.late_exact.evaluation_mode = LateExactEvaluationMode::Fast;
-
-        let recommendation =
-            recommend_move_belief_uct(&belief, &solver, &planner_config(61)).unwrap();
-
-        assert!(recommendation.late_exact_triggered);
-        assert_eq!(
-            recommendation.late_exact_hidden_count,
-            belief.hidden_card_count()
-        );
-        assert!(recommendation.late_exact_actions_evaluated <= 2);
-        assert!(recommendation.late_exact_assignments_enumerated > 0);
-        assert!(recommendation
-            .action_stats
-            .iter()
-            .any(|stats| stats.late_exact_evaluated));
-    }
-
-    #[test]
-    fn planner_skips_late_exact_above_threshold() {
-        let belief = reveal_belief();
-        let mut solver = solver_config();
-        solver.late_exact.hidden_card_threshold = 1;
-        solver.late_exact.max_root_actions = 2;
-        solver.late_exact.evaluation_mode = LateExactEvaluationMode::Fast;
-
-        let recommendation =
-            recommend_move_belief_uct(&belief, &solver, &planner_config(62)).unwrap();
-
-        assert!(!recommendation.late_exact_triggered);
-        assert_eq!(recommendation.late_exact_actions_evaluated, 0);
-        assert_eq!(recommendation.late_exact_assignments_enumerated, 0);
-    }
 }

@@ -8,16 +8,20 @@
 mod autoplay;
 mod benchmark;
 mod calibration;
+mod oracle;
 mod pimc;
 mod presets;
+mod regression;
 mod reporting;
 
 pub(crate) use autoplay::recommend_autoplay_move;
 pub use autoplay::*;
 pub use benchmark::*;
 pub use calibration::*;
+pub use oracle::*;
 pub use pimc::*;
 pub use presets::*;
+pub use regression::*;
 pub use reporting::*;
 
 use serde::Serialize;
@@ -70,7 +74,17 @@ fn deterministic_search_config_from_parts(
             capacity: deterministic.tt_capacity,
             store_approx: deterministic.tt_store_approx,
         },
+        leaf_eval_mode: deterministic.leaf_eval_mode,
     }
+}
+
+pub(crate) fn vnet_model_path_string(solver_config: &SolverConfig) -> Option<String> {
+    solver_config
+        .deterministic
+        .vnet_inference
+        .model_path
+        .as_ref()
+        .map(|path| path.display().to_string())
 }
 
 fn summarize_benchmark(
@@ -93,6 +107,25 @@ fn summarize_benchmark(
             .map(|record| record.deterministic_nodes as f64),
     );
     let mean_samples = mean(records.iter().map(|record| record.sample_count as f64));
+    let leaf_eval_mode = records
+        .first()
+        .map(|record| record.leaf_eval_mode)
+        .unwrap_or_default();
+    let vnet_model_path = records
+        .first()
+        .and_then(|record| record.vnet_model_path.clone());
+    let vnet_inferences = records
+        .iter()
+        .map(|record| record.vnet_inferences)
+        .sum::<u64>();
+    let vnet_fallbacks = records
+        .iter()
+        .map(|record| record.vnet_fallbacks)
+        .sum::<u64>();
+    let vnet_inference_elapsed_us = records
+        .iter()
+        .map(|record| record.vnet_inference_elapsed_us)
+        .sum::<u64>();
 
     BenchmarkResult {
         config,
@@ -106,6 +139,11 @@ fn summarize_benchmark(
         mean_time_ms,
         mean_nodes,
         mean_samples,
+        leaf_eval_mode,
+        vnet_model_path,
+        vnet_inferences,
+        vnet_fallbacks,
+        vnet_inference_elapsed_us,
     }
 }
 
@@ -140,10 +178,43 @@ fn summarize_autoplay_benchmark(
             .map(|record| record.deterministic_nodes as f64),
     );
     let average_root_visits = mean(records.iter().map(|record| record.root_visits as f64));
+    let root_parallel_step_count = records
+        .iter()
+        .map(|record| record.root_parallel_steps)
+        .sum::<usize>();
+    let average_root_parallel_workers = mean(
+        records
+            .iter()
+            .map(|record| record.root_parallel_worker_count as f64),
+    );
+    let average_root_parallel_simulations = mean(
+        records
+            .iter()
+            .map(|record| record.root_parallel_simulations as f64),
+    );
     let late_exact_trigger_count = records
         .iter()
         .map(|record| record.late_exact_triggers)
         .sum::<usize>();
+    let leaf_eval_mode = records
+        .first()
+        .map(|record| record.leaf_eval_mode)
+        .unwrap_or_default();
+    let vnet_model_path = records
+        .first()
+        .and_then(|record| record.vnet_model_path.clone());
+    let vnet_inferences = records
+        .iter()
+        .map(|record| record.vnet_inferences)
+        .sum::<u64>();
+    let vnet_fallbacks = records
+        .iter()
+        .map(|record| record.vnet_fallbacks)
+        .sum::<u64>();
+    let vnet_inference_elapsed_us = records
+        .iter()
+        .map(|record| record.vnet_inference_elapsed_us)
+        .sum::<u64>();
     let terminations = summarize_terminations(&records);
 
     AutoplayBenchmarkResult {
@@ -161,7 +232,15 @@ fn summarize_autoplay_benchmark(
         average_total_planner_time_per_game_ms,
         average_deterministic_nodes,
         average_root_visits,
+        root_parallel_step_count,
+        average_root_parallel_workers,
+        average_root_parallel_simulations,
         late_exact_trigger_count,
+        leaf_eval_mode,
+        vnet_model_path,
+        vnet_inferences,
+        vnet_fallbacks,
+        vnet_inference_elapsed_us,
         terminations,
     }
 }
@@ -366,6 +445,7 @@ mod tests {
         core::{FoundationState, HiddenSlot},
         deterministic_solver::{ordered_macro_moves, SolveOutcome},
         late_exact::LateExactEvaluationMode,
+        ml::LeafEvaluationMode,
         moves::MacroMoveKind,
         planner::{BeliefPlannerConfig, PlannerLeafEvalMode},
     };
@@ -394,6 +474,7 @@ mod tests {
                 },
                 ..DeterministicSearchConfig::default()
             },
+            vnet_inference: crate::ml::VNetInferenceConfig::default(),
         }
     }
 
@@ -554,8 +635,22 @@ mod tests {
             .clone(),
         );
 
-        stats.record(1.0, SolveOutcome::ProvenWin, 10);
-        stats.record(0.0, SolveOutcome::ProvenLoss, 20);
+        stats.record(PimcActionValue {
+            value: 1.0,
+            outcome: SolveOutcome::ProvenWin,
+            deterministic_nodes: 10,
+            vnet_inferences: 0,
+            vnet_fallbacks: 0,
+            vnet_inference_elapsed_us: 0,
+        });
+        stats.record(PimcActionValue {
+            value: 0.0,
+            outcome: SolveOutcome::ProvenLoss,
+            deterministic_nodes: 20,
+            vnet_inferences: 0,
+            vnet_fallbacks: 0,
+            vnet_inference_elapsed_us: 0,
+        });
 
         assert_eq!(stats.visits, 2);
         assert_eq!(stats.exact_wins, 1);
@@ -661,6 +756,23 @@ mod tests {
     }
 
     #[test]
+    fn vnet_presets_are_named_and_enable_vnet_leaf_mode() {
+        for preset in [
+            fast_vnet_benchmark(),
+            balanced_vnet_benchmark(),
+            quality_vnet_benchmark(),
+        ] {
+            assert!(preset.name.ends_with("_vnet_benchmark"));
+            assert_eq!(
+                preset.solver.deterministic.leaf_eval_mode,
+                LeafEvaluationMode::VNet
+            );
+            assert!(preset.solver.deterministic.vnet_inference.enable_vnet);
+            assert_eq!(preset.autoplay.backend, PlannerBackend::BeliefUctLateExact);
+        }
+    }
+
+    #[test]
     fn preset_comparison_is_reproducible_and_stably_ranked() {
         let suite = BenchmarkSuite::from_base_seed("preset-compare", 910, 1);
         let mut fast = fast_benchmark();
@@ -703,7 +815,34 @@ mod tests {
 
         let csv = summary.to_csv_summary();
         assert!(csv.starts_with("ranking_metric,preset_name,backend"));
+        assert!(csv.contains("leaf_eval_mode"));
+        assert!(csv.contains("vnet_inferences"));
         assert!(csv.contains("fast_benchmark"));
+    }
+
+    #[test]
+    fn vnet_impact_summary_is_reproducible_on_fixed_suite() {
+        let suite = BenchmarkSuite::from_base_seed("vnet-impact", 930, 1);
+        let mut preset = fast_benchmark();
+        preset.autoplay.max_steps = 0;
+
+        let first = compare_vnet_leaf_mode_on_suite(
+            &suite,
+            &preset,
+            std::path::PathBuf::from("missing-vnet-artifact.json"),
+        )
+        .unwrap();
+        let second = compare_vnet_leaf_mode_on_suite(
+            &suite,
+            &preset,
+            std::path::PathBuf::from("missing-vnet-artifact.json"),
+        )
+        .unwrap();
+
+        assert_eq!(first, second);
+        assert_eq!(first.baseline.leaf_eval_mode, LeafEvaluationMode::Heuristic);
+        assert_eq!(first.vnet.leaf_eval_mode, LeafEvaluationMode::VNet);
+        assert_eq!(first.win_rate_delta, first.comparison.paired_win_rate_delta);
     }
 
     #[test]

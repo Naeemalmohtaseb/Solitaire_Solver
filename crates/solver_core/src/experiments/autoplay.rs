@@ -15,7 +15,7 @@ use crate::{
 };
 
 use super::{
-    action_seed, deterministic_search_config_from_solver, recommend_move_pimc, PimcConfig,
+    action_seed, deterministic_search_config_from_solver, recommend_move_pimc_with_vnet, PimcConfig,
 };
 /// Planner backend used for full-game autoplay.
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -81,8 +81,20 @@ pub struct AutoplayPlannerSnapshot {
     pub deterministic_nodes: u64,
     /// Root simulations, samples, or visits reported by the backend.
     pub root_visits: u64,
+    /// Whether the decision used independent root-parallel workers.
+    pub root_parallel_used: bool,
+    /// Number of root workers contributing to the decision.
+    pub root_parallel_workers: usize,
+    /// Aggregated root-parallel worker simulations for this decision.
+    pub root_parallel_simulations: usize,
     /// Whether late-exact triggered during this step.
     pub late_exact_triggered: bool,
+    /// V-Net inference calls used by this decision.
+    pub vnet_inferences: u64,
+    /// V-Net fallback count for this decision.
+    pub vnet_fallbacks: u64,
+    /// V-Net inference time in microseconds for this decision.
+    pub vnet_inference_elapsed_us: u64,
 }
 
 /// One applied full-game autoplay step.
@@ -140,8 +152,20 @@ pub struct AutoplayResult {
     pub deterministic_nodes: u64,
     /// Total root simulations/samples/visits reported by planners.
     pub root_visits: u64,
+    /// Number of planner decisions that used root-parallel workers.
+    pub root_parallel_steps: usize,
+    /// Sum of root workers used across planner decisions.
+    pub root_parallel_worker_count: usize,
+    /// Total simulations reported by root-parallel workers.
+    pub root_parallel_simulations: usize,
     /// Number of steps where late-exact triggered.
     pub late_exact_triggers: usize,
+    /// Total V-Net inference calls reported by planners.
+    pub vnet_inferences: u64,
+    /// Total V-Net fallback count reported by planners.
+    pub vnet_fallbacks: u64,
+    /// Total V-Net inference time in microseconds.
+    pub vnet_inference_elapsed_us: u64,
 }
 
 /// Plays one true full game using the selected hidden-information backend.
@@ -156,7 +180,13 @@ pub fn play_game_with_planner(
     let mut total_planner_time_ms = 0u64;
     let mut deterministic_nodes = 0u64;
     let mut root_visits = 0u64;
+    let mut root_parallel_steps = 0usize;
+    let mut root_parallel_worker_count = 0usize;
+    let mut root_parallel_simulations = 0usize;
     let mut late_exact_triggers = 0usize;
+    let mut vnet_inferences = 0u64;
+    let mut vnet_fallbacks = 0u64;
+    let mut vnet_inference_elapsed_us = 0u64;
 
     for step_index in 0..autoplay_config.max_steps {
         if true_state.visible.is_structural_win() {
@@ -169,7 +199,13 @@ pub fn play_game_with_planner(
                 total_planner_time_ms,
                 deterministic_nodes,
                 root_visits,
+                root_parallel_steps,
+                root_parallel_worker_count,
+                root_parallel_simulations,
                 late_exact_triggers,
+                vnet_inferences,
+                vnet_fallbacks,
+                vnet_inference_elapsed_us,
             });
         }
 
@@ -186,7 +222,13 @@ pub fn play_game_with_planner(
                 total_planner_time_ms,
                 deterministic_nodes,
                 root_visits,
+                root_parallel_steps,
+                root_parallel_worker_count,
+                root_parallel_simulations,
                 late_exact_triggers,
+                vnet_inferences,
+                vnet_fallbacks,
+                vnet_inference_elapsed_us,
             });
         }
 
@@ -203,9 +245,20 @@ pub fn play_game_with_planner(
         deterministic_nodes =
             deterministic_nodes.saturating_add(decision.snapshot.deterministic_nodes);
         root_visits = root_visits.saturating_add(decision.snapshot.root_visits);
+        if decision.snapshot.root_parallel_used {
+            root_parallel_steps += 1;
+            root_parallel_worker_count =
+                root_parallel_worker_count.saturating_add(decision.snapshot.root_parallel_workers);
+            root_parallel_simulations = root_parallel_simulations
+                .saturating_add(decision.snapshot.root_parallel_simulations);
+        }
         if decision.snapshot.late_exact_triggered {
             late_exact_triggers += 1;
         }
+        vnet_inferences = vnet_inferences.saturating_add(decision.snapshot.vnet_inferences);
+        vnet_fallbacks = vnet_fallbacks.saturating_add(decision.snapshot.vnet_fallbacks);
+        vnet_inference_elapsed_us =
+            vnet_inference_elapsed_us.saturating_add(decision.snapshot.vnet_inference_elapsed_us);
 
         let Some(chosen_move) = decision.best_move else {
             return Ok(AutoplayResult {
@@ -217,7 +270,13 @@ pub fn play_game_with_planner(
                 total_planner_time_ms,
                 deterministic_nodes,
                 root_visits,
+                root_parallel_steps,
+                root_parallel_worker_count,
+                root_parallel_simulations,
                 late_exact_triggers,
+                vnet_inferences,
+                vnet_fallbacks,
+                vnet_inference_elapsed_us,
             });
         };
 
@@ -256,7 +315,13 @@ pub fn play_game_with_planner(
         total_planner_time_ms,
         deterministic_nodes,
         root_visits,
+        root_parallel_steps,
+        root_parallel_worker_count,
+        root_parallel_simulations,
         late_exact_triggers,
+        vnet_inferences,
+        vnet_fallbacks,
+        vnet_inference_elapsed_us,
     })
 }
 
@@ -277,10 +342,11 @@ pub(crate) fn recommend_autoplay_move(
         PlannerBackend::Pimc => {
             let mut pimc = pimc_config;
             pimc.rng_seed = action_seed(pimc.rng_seed, step_index);
-            let recommendation = recommend_move_pimc(
+            let recommendation = recommend_move_pimc_with_vnet(
                 belief,
                 deterministic_search_config_from_solver(solver_config),
                 pimc,
+                solver_config.deterministic.vnet_inference.clone(),
             )?;
             let root_visits = recommendation
                 .action_stats
@@ -295,7 +361,13 @@ pub(crate) fn recommend_autoplay_move(
                     elapsed_ms: recommendation.elapsed_ms,
                     deterministic_nodes: recommendation.deterministic_nodes,
                     root_visits,
+                    root_parallel_used: false,
+                    root_parallel_workers: 1,
+                    root_parallel_simulations: root_visits as usize,
                     late_exact_triggered: false,
+                    vnet_inferences: recommendation.vnet_inferences,
+                    vnet_fallbacks: recommendation.vnet_fallbacks,
+                    vnet_inference_elapsed_us: recommendation.vnet_inference_elapsed_us,
                 },
             })
         }
@@ -332,6 +404,12 @@ fn planner_snapshot_from_recommendation(
             .deterministic_nodes
             .saturating_add(recommendation.late_exact_deterministic_nodes),
         root_visits: recommendation.simulations_run as u64,
+        root_parallel_used: recommendation.root_parallel_used,
+        root_parallel_workers: recommendation.root_parallel_workers,
+        root_parallel_simulations: recommendation.root_parallel_worker_simulations.iter().sum(),
         late_exact_triggered: recommendation.late_exact_triggered,
+        vnet_inferences: recommendation.vnet_inferences,
+        vnet_fallbacks: recommendation.vnet_fallbacks,
+        vnet_inference_elapsed_us: recommendation.vnet_inference_elapsed_us,
     }
 }

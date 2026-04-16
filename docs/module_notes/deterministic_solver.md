@@ -3,6 +3,11 @@
 Owns the perfect-information open-card solver used by later belief-state
 planning.
 
+The production module keeps the public result/config/TT/search surfaces together
+because those pieces are tightly coupled in the current DFS implementation.
+Regression tests live in `deterministic_solver/tests.rs` so the solver module is
+easier to scan without changing its public API.
+
 The first implementation is a deterministic DFS-based searcher with:
 
 - exact/proof-oriented solve attempts
@@ -13,6 +18,7 @@ The first implementation is a deterministic DFS-based searcher with:
 - deterministic move ordering
 - closure integration at every node
 - deterministic-state transposition-table reuse
+- optional V-Net approximate leaf evaluation
 
 The solver operates on `FullState`. When a move reveals a hidden tableau card,
 the concrete card is read from `HiddenAssignments`, the visible move engine is
@@ -31,5 +37,12 @@ priority-based replacement. Zobrist hashing and richer bound handling can
 replace the structural hash/interface later without changing planner-facing
 solver APIs.
 
-No belief-state sampling, UCT/MCTS, neural inference, or late-game exact
-assignment enumeration belongs in this module.
+`LeafEvaluationMode::VNet` can replace the handcrafted cutoff evaluator with a
+loaded V-Net artifact for fast/bounded leaf values. This is deliberately
+approximate: exact/proof-oriented outcomes still require proven search results,
+and V-Net values are never allowed to masquerade as proof. If no evaluator is
+loaded, the solver falls back to the existing heuristic and records fallback
+diagnostics.
+
+No belief-state sampling, UCT/MCTS, P-Net policy logic, online training, or
+late-game exact assignment enumeration belongs in this module.

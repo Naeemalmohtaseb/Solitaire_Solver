@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 use crate::{
     config::{ExperimentConfig, SolverConfig},
     late_exact::LateExactEvaluationMode,
+    ml::LeafEvaluationMode,
     planner::{BeliefPlannerConfig, PlannerLeafEvalMode},
     types::DealSeed,
 };
@@ -20,8 +21,11 @@ pub const EXPERIMENT_PRESET_NAMES: &[&str] = &[
     "belief_uct_default",
     "belief_uct_late_exact",
     "fast_benchmark",
+    "fast_vnet_benchmark",
     "balanced_benchmark",
+    "balanced_vnet_benchmark",
     "quality_benchmark",
+    "quality_vnet_benchmark",
 ];
 
 /// Looks up a benchmark preset by its stable name.
@@ -31,8 +35,11 @@ pub fn experiment_preset_by_name(name: &str) -> Option<ExperimentPreset> {
         "belief_uct_default" => Some(belief_uct_default()),
         "belief_uct_late_exact" => Some(belief_uct_late_exact()),
         "fast_benchmark" => Some(fast_benchmark()),
+        "fast_vnet_benchmark" => Some(fast_vnet_benchmark()),
         "balanced_benchmark" => Some(balanced_benchmark()),
+        "balanced_vnet_benchmark" => Some(balanced_vnet_benchmark()),
         "quality_benchmark" => Some(quality_benchmark()),
+        "quality_vnet_benchmark" => Some(quality_vnet_benchmark()),
         _ => None,
     }
 }
@@ -66,6 +73,7 @@ impl ExperimentPreset {
             label: EngineConfigLabel::new(self.name.clone()),
             pimc: self.autoplay.pimc,
             deterministic: deterministic_search_config_from_solver(&self.solver),
+            vnet_inference: self.solver.deterministic.vnet_inference.clone(),
         }
     }
 }
@@ -164,6 +172,18 @@ pub fn fast_benchmark() -> ExperimentPreset {
     preset
 }
 
+/// Fast preset configured for V-Net approximate leaves.
+pub fn fast_vnet_benchmark() -> ExperimentPreset {
+    let mut preset = fast_benchmark();
+    preset.name = "fast_vnet_benchmark".to_string();
+    enable_vnet_leaf_mode(&mut preset);
+    preset.solver.belief_planner.simulation_budget = 32;
+    preset.solver.belief_planner.initial_screen_simulations = 8;
+    preset.solver.belief_planner.min_simulations_before_stop = 16;
+    preset.solver.belief_planner.leaf_world_samples = 1;
+    preset
+}
+
 /// Middle-ground preset for practical local tuning runs.
 pub fn balanced_benchmark() -> ExperimentPreset {
     let mut preset = belief_uct_late_exact();
@@ -191,6 +211,22 @@ pub fn balanced_benchmark() -> ExperimentPreset {
     preset
 }
 
+/// Balanced preset configured for V-Net approximate leaves.
+pub fn balanced_vnet_benchmark() -> ExperimentPreset {
+    let mut preset = balanced_benchmark();
+    preset.name = "balanced_vnet_benchmark".to_string();
+    enable_vnet_leaf_mode(&mut preset);
+    preset.solver.belief_planner.simulation_budget = 160;
+    preset.solver.belief_planner.initial_screen_simulations = 32;
+    preset.solver.belief_planner.min_simulations_before_stop = 64;
+    preset.solver.belief_planner.leaf_world_samples = 1;
+    preset
+        .solver
+        .belief_planner
+        .second_reveal_refinement_simulations = 12;
+    preset
+}
+
 /// Heavier preset intended for higher-quality local benchmark runs.
 pub fn quality_benchmark() -> ExperimentPreset {
     let mut preset = belief_uct_late_exact();
@@ -209,4 +245,21 @@ pub fn quality_benchmark() -> ExperimentPreset {
     preset.experiments.default_suite_size = 1_000;
     preset.experiments.repetitions = 5;
     preset
+}
+
+/// Quality preset configured for V-Net approximate leaves.
+pub fn quality_vnet_benchmark() -> ExperimentPreset {
+    let mut preset = quality_benchmark();
+    preset.name = "quality_vnet_benchmark".to_string();
+    enable_vnet_leaf_mode(&mut preset);
+    preset.solver.belief_planner.simulation_budget = 640;
+    preset.solver.belief_planner.initial_screen_simulations = 80;
+    preset.solver.belief_planner.min_simulations_before_stop = 160;
+    preset.solver.belief_planner.leaf_world_samples = 2;
+    preset
+}
+
+fn enable_vnet_leaf_mode(preset: &mut ExperimentPreset) {
+    preset.solver.deterministic.leaf_eval_mode = LeafEvaluationMode::VNet;
+    preset.solver.deterministic.vnet_inference.enable_vnet = true;
 }

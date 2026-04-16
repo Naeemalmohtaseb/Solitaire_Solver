@@ -2,12 +2,17 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::error::{SolverError, SolverResult};
+use std::path::PathBuf;
+
+use crate::{
+    error::{SolverError, SolverResult},
+    ml::LeafEvaluationMode,
+};
 
 use super::{
     csv_table, experiment_preset_by_name, optional_seed_string, to_pretty_json,
-    AutoplayBenchmarkConfig, AutoplayBenchmarkResult, BenchmarkSuite, BenchmarkSuiteDescription,
-    ExperimentPreset, ExperimentRunner, PlannerBackend,
+    AutoplayBenchmarkConfig, AutoplayBenchmarkResult, AutoplayComparisonResult, BenchmarkSuite,
+    BenchmarkSuiteDescription, ExperimentPreset, ExperimentRunner, PlannerBackend,
 };
 
 /// Ranking metric used by preset comparison reports.
@@ -54,6 +59,16 @@ pub struct PresetComparisonEntry {
     pub average_root_visits: f64,
     /// Total late-exact triggers.
     pub late_exact_trigger_count: usize,
+    /// Leaf evaluation mode actually configured for this preset.
+    pub leaf_eval_mode: LeafEvaluationMode,
+    /// V-Net model path or artifact id, if configured.
+    pub vnet_model_path: Option<String>,
+    /// Total V-Net inference calls.
+    pub vnet_inferences: u64,
+    /// Total V-Net fallback count.
+    pub vnet_fallbacks: u64,
+    /// Total V-Net inference time in microseconds.
+    pub vnet_inference_elapsed_us: u64,
     /// Win-rate per planner-second.
     pub win_rate_per_second: f64,
     /// Rank by win rate.
@@ -83,6 +98,11 @@ impl PresetComparisonEntry {
             average_deterministic_nodes: result.average_deterministic_nodes,
             average_root_visits: result.average_root_visits,
             late_exact_trigger_count: result.late_exact_trigger_count,
+            leaf_eval_mode: result.leaf_eval_mode,
+            vnet_model_path: result.vnet_model_path.clone(),
+            vnet_inferences: result.vnet_inferences,
+            vnet_fallbacks: result.vnet_fallbacks,
+            vnet_inference_elapsed_us: result.vnet_inference_elapsed_us,
             win_rate_per_second,
             win_rate_rank: 0,
             time_rank: 0,
@@ -129,6 +149,11 @@ impl PresetComparisonSummary {
                     entry.average_deterministic_nodes.to_string(),
                     entry.average_root_visits.to_string(),
                     entry.late_exact_trigger_count.to_string(),
+                    format!("{:?}", entry.leaf_eval_mode),
+                    entry.vnet_model_path.clone().unwrap_or_default(),
+                    entry.vnet_inferences.to_string(),
+                    entry.vnet_fallbacks.to_string(),
+                    entry.vnet_inference_elapsed_us.to_string(),
                     entry.win_rate_per_second.to_string(),
                     entry.win_rate_rank.to_string(),
                     entry.time_rank.to_string(),
@@ -152,6 +177,11 @@ impl PresetComparisonSummary {
                 "avg_deterministic_nodes",
                 "avg_root_visits",
                 "late_exact_trigger_count",
+                "leaf_eval_mode",
+                "vnet_model_path",
+                "vnet_inferences",
+                "vnet_fallbacks",
+                "vnet_inference_elapsed_us",
                 "win_rate_per_second",
                 "win_rate_rank",
                 "time_rank",
@@ -160,6 +190,25 @@ impl PresetComparisonSummary {
             &rows,
         )
     }
+}
+
+/// Compact summary of V-Net leaf-evaluation impact for one paired comparison.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct VNetImpactSummary {
+    /// Non-neural baseline benchmark.
+    pub baseline: AutoplayBenchmarkResult,
+    /// V-Net-assisted benchmark.
+    pub vnet: AutoplayBenchmarkResult,
+    /// Full paired comparison result.
+    pub comparison: AutoplayComparisonResult,
+    /// V-Net minus baseline win-rate difference.
+    pub win_rate_delta: f64,
+    /// V-Net minus baseline average time per game, in milliseconds.
+    pub time_per_game_delta_ms: f64,
+    /// V-Net minus baseline efficiency score.
+    pub efficiency_delta: f64,
+    /// V-Net fallback count divided by V-Net inference attempts.
+    pub fallback_rate: f64,
 }
 
 /// Compares benchmark presets on the same autoplay suite.
@@ -191,6 +240,60 @@ pub fn compare_named_presets_on_suite(
         presets.push(preset);
     }
     compare_experiment_presets_on_suite(suite, &presets, ranking_metric)
+}
+
+/// Compares one preset with heuristic leaves against the same preset with V-Net leaves.
+pub fn compare_vnet_leaf_mode_on_suite(
+    suite: &BenchmarkSuite,
+    preset: &ExperimentPreset,
+    vnet_model_path: impl Into<PathBuf>,
+) -> SolverResult<VNetImpactSummary> {
+    let baseline = heuristic_leaf_variant(preset);
+    let vnet = vnet_leaf_variant(preset, vnet_model_path.into());
+    let runner = ExperimentRunner;
+    let baseline_config = baseline.autoplay_benchmark_config();
+    let vnet_config = vnet.autoplay_benchmark_config();
+    let comparison =
+        runner.run_autoplay_paired_comparison(suite, &baseline_config, &vnet_config)?;
+    let fallback_rate = if comparison.candidate.vnet_inferences == 0 {
+        0.0
+    } else {
+        comparison.candidate.vnet_fallbacks as f64 / comparison.candidate.vnet_inferences as f64
+    };
+    Ok(VNetImpactSummary {
+        baseline: comparison.baseline.clone(),
+        vnet: comparison.candidate.clone(),
+        win_rate_delta: comparison.paired_win_rate_delta,
+        time_per_game_delta_ms: comparison.candidate.average_total_planner_time_per_game_ms
+            - comparison.baseline.average_total_planner_time_per_game_ms,
+        efficiency_delta: efficiency_score(
+            comparison.candidate.win_rate,
+            comparison.candidate.average_total_planner_time_per_game_ms,
+        ) - efficiency_score(
+            comparison.baseline.win_rate,
+            comparison.baseline.average_total_planner_time_per_game_ms,
+        ),
+        fallback_rate,
+        comparison,
+    })
+}
+
+fn heuristic_leaf_variant(preset: &ExperimentPreset) -> ExperimentPreset {
+    let mut baseline = preset.clone();
+    baseline.name = format!("{}_heuristic", preset.name);
+    baseline.solver.deterministic.leaf_eval_mode = LeafEvaluationMode::Heuristic;
+    baseline.solver.deterministic.vnet_inference.enable_vnet = false;
+    baseline.solver.deterministic.vnet_inference.model_path = None;
+    baseline
+}
+
+fn vnet_leaf_variant(preset: &ExperimentPreset, model_path: PathBuf) -> ExperimentPreset {
+    let mut vnet = preset.clone();
+    vnet.name = format!("{}_vnet", preset.name);
+    vnet.solver.deterministic.leaf_eval_mode = LeafEvaluationMode::VNet;
+    vnet.solver.deterministic.vnet_inference.enable_vnet = true;
+    vnet.solver.deterministic.vnet_inference.model_path = Some(model_path);
+    vnet
 }
 
 fn compare_preset_configs_on_suite(

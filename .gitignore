@@ -1,3 +1,14 @@
 /target/
 /target_verify*/
 /target_moves*/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+/python/.venv/
+/python/data/
+/python/runs/
+/python/checkpoints/
+/artifacts/
+/data/

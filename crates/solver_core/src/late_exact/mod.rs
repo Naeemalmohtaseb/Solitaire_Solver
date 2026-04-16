@@ -170,6 +170,8 @@ pub struct LateExactResult {
     pub deterministic_nodes: u64,
     /// Elapsed evaluation time in milliseconds.
     pub elapsed_ms: u64,
+    /// Time spent traversing hidden assignments, excluding per-action solver work.
+    pub assignment_enumeration_elapsed_us: u64,
 }
 
 impl LateExactResult {
@@ -186,6 +188,7 @@ impl LateExactResult {
             action_stats: Vec::new(),
             deterministic_nodes: 0,
             elapsed_ms: 0,
+            assignment_enumeration_elapsed_us: 0,
         }
     }
 }
@@ -233,11 +236,16 @@ impl LateExactEvaluator {
 
         let action_limit = self.config.max_root_actions.max(1).min(actions.len());
         let actions = &actions[..action_limit];
-        let assignments = enumerate_hidden_assignments(belief, self.config.assignment_budget)?;
-        let exhaustive = self.config.assignment_budget.is_none_or(|budget| {
-            assignments.len() < budget as usize
-                || assignment_count_for_belief(belief).is_some_and(|total| total <= budget as u128)
-        });
+        let prefix = AssignmentPrefix::from_belief(belief)?;
+        if prefix.slots.len() != prefix.remaining_cards.len() {
+            return Err(SolverError::UnseenCountMismatch {
+                expected: prefix.slots.len(),
+                actual: prefix.remaining_cards.len(),
+            });
+        }
+        let budget = self.config.assignment_budget.unwrap_or(u64::MAX);
+        let exhaustive =
+            assignment_count_for_belief(belief).is_some_and(|total| u128::from(budget) >= total);
 
         let solver = DeterministicSolver::new(self.deterministic_config);
         let mut action_stats = actions
@@ -246,14 +254,21 @@ impl LateExactEvaluator {
             .map(LateExactActionStats::new)
             .collect::<Vec<_>>();
 
-        for assignments in &assignments {
-            let full = FullState::new(belief.visible.clone(), assignments.clone());
-            full.validate_consistency()?;
+        let traversal_started = Instant::now();
+        let mut callback_elapsed_us = 0u64;
+        for_each_hidden_assignment(&prefix, budget, |assignments| {
+            let eval_started = Instant::now();
+            let full = FullState::new(belief.visible.clone(), assignments);
+            full.debug_validate()?;
             for stats in &mut action_stats {
                 let value = self.evaluate_action_in_full_state(&full, &stats.action, &solver)?;
                 stats.record(value.value, value.outcome, value.deterministic_nodes);
             }
-        }
+            callback_elapsed_us = callback_elapsed_us.saturating_add(elapsed_micros(eval_started));
+            Ok(())
+        })?;
+        let assignment_enumeration_elapsed_us =
+            elapsed_micros(traversal_started).saturating_sub(callback_elapsed_us);
 
         action_stats.sort_by(|left, right| {
             right
@@ -293,6 +308,7 @@ impl LateExactEvaluator {
             action_stats,
             deterministic_nodes,
             elapsed_ms: started.elapsed().as_millis() as u64,
+            assignment_enumeration_elapsed_us,
         })
     }
 
@@ -352,8 +368,14 @@ pub fn enumerate_hidden_assignments(
         return Ok(Vec::new());
     }
 
-    let mut output = Vec::new();
-    enumerate_prefix(prefix, budget, &mut output)?;
+    let capacity = assignment_count_for_belief(belief)
+        .map(|count| count.min(u128::from(budget)).min(usize::MAX as u128) as usize)
+        .unwrap_or_default();
+    let mut output = Vec::with_capacity(capacity);
+    for_each_hidden_assignment(&prefix, budget, |assignments| {
+        output.push(assignments);
+        Ok(())
+    })?;
     Ok(output)
 }
 
@@ -365,43 +387,58 @@ pub fn assignment_count_for_belief(belief: &BeliefState) -> Option<u128> {
     Some(factorial(belief.hidden_card_count() as u8))
 }
 
-fn enumerate_prefix(
-    prefix: AssignmentPrefix,
+fn for_each_hidden_assignment(
+    prefix: &AssignmentPrefix,
     budget: u64,
-    output: &mut Vec<HiddenAssignments>,
+    mut visitor: impl FnMut(HiddenAssignments) -> SolverResult<()>,
 ) -> SolverResult<()> {
-    if output.len() as u64 >= budget {
+    let mut remaining_cards = prefix.remaining_cards.clone();
+    let mut assigned = prefix.assigned.clone();
+    let mut emitted = 0u64;
+    enumerate_prefix_mut(
+        &prefix.slots,
+        &mut remaining_cards,
+        &mut assigned,
+        budget,
+        &mut emitted,
+        &mut visitor,
+    )
+}
+
+fn enumerate_prefix_mut(
+    slots: &[HiddenSlot],
+    remaining_cards: &mut Vec<Card>,
+    assigned: &mut Vec<HiddenAssignment>,
+    budget: u64,
+    emitted: &mut u64,
+    visitor: &mut impl FnMut(HiddenAssignments) -> SolverResult<()>,
+) -> SolverResult<()> {
+    if *emitted >= budget {
         return Ok(());
     }
 
-    let Some(slot) = prefix.next_slot() else {
-        output.push(HiddenAssignments::new(prefix.assigned));
-        return Ok(());
+    let Some(slot) = slots.get(assigned.len()).copied() else {
+        *emitted += 1;
+        return visitor(HiddenAssignments::new(assigned.clone()));
     };
 
-    for index in 0..prefix.remaining_cards.len() {
-        if output.len() as u64 >= budget {
+    let choice_count = remaining_cards.len();
+    for index in 0..choice_count {
+        if *emitted >= budget {
             break;
         }
-        let card = prefix.remaining_cards[index];
-        let mut next_remaining = prefix.remaining_cards.clone();
-        next_remaining.remove(index);
-
-        let mut next_assigned = prefix.assigned.clone();
-        next_assigned.push(HiddenAssignment::new(slot, card));
-
-        enumerate_prefix(
-            AssignmentPrefix {
-                slots: prefix.slots.clone(),
-                assigned: next_assigned,
-                remaining_cards: next_remaining,
-            },
-            budget,
-            output,
-        )?;
+        let card = remaining_cards.remove(index);
+        assigned.push(HiddenAssignment::new(slot, card));
+        enumerate_prefix_mut(slots, remaining_cards, assigned, budget, emitted, visitor)?;
+        assigned.pop();
+        remaining_cards.insert(index, card);
     }
 
     Ok(())
+}
+
+fn elapsed_micros(started: Instant) -> u64 {
+    started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64
 }
 
 const fn factorial(count: u8) -> u128 {

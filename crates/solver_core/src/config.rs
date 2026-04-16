@@ -2,7 +2,12 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::{closure::ClosureConfig, late_exact::LateExactConfig, planner::BeliefPlannerConfig};
+use crate::{
+    closure::ClosureConfig,
+    late_exact::LateExactConfig,
+    ml::{LeafEvaluationMode, VNetInferenceConfig},
+    planner::BeliefPlannerConfig,
+};
 
 /// Top-level configuration object passed into future recommendation calls.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -43,7 +48,8 @@ pub struct SearchConfig {
     pub node_budget: Option<u64>,
     /// Optional deterministic seed for reproducible planner behavior.
     pub rng_seed: Option<u64>,
-    /// Number of independent root workers to use when parallel search is enabled.
+    /// Shared root-worker hint for callers. The belief planner's concrete
+    /// root-parallel controls live in `BeliefPlannerConfig`.
     pub root_workers: usize,
 }
 
@@ -77,6 +83,10 @@ pub struct DeterministicSolverConfig {
     pub tt_capacity: usize,
     /// Whether budget-limited heuristic values may be stored in the TT.
     pub tt_store_approx: bool,
+    /// Approximate evaluator used at deterministic search cutoffs and fast leaves.
+    pub leaf_eval_mode: LeafEvaluationMode,
+    /// Optional V-Net inference artifact controls.
+    pub vnet_inference: VNetInferenceConfig,
 }
 
 impl Default for DeterministicSolverConfig {
@@ -90,6 +100,8 @@ impl Default for DeterministicSolverConfig {
             enable_tt: true,
             tt_capacity: 65_536,
             tt_store_approx: true,
+            leaf_eval_mode: LeafEvaluationMode::Heuristic,
+            vnet_inference: VNetInferenceConfig::default(),
         }
     }
 }
