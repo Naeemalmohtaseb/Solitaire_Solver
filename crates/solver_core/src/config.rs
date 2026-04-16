@@ -2,7 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::closure::ClosureConfig;
+use crate::{closure::ClosureConfig, late_exact::LateExactConfig, planner::BeliefPlannerConfig};
 
 /// Top-level configuration object passed into future recommendation calls.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -71,6 +71,12 @@ pub struct DeterministicSolverConfig {
     pub enable_dominance_pruning: bool,
     /// Whether foundation-to-tableau retreat moves are generated.
     pub enable_foundation_retreats: bool,
+    /// Whether the deterministic open-card transposition table is enabled.
+    pub enable_tt: bool,
+    /// Number of slots in the deterministic open-card transposition table.
+    pub tt_capacity: usize,
+    /// Whether budget-limited heuristic values may be stored in the TT.
+    pub tt_store_approx: bool,
 }
 
 impl Default for DeterministicSolverConfig {
@@ -81,57 +87,9 @@ impl Default for DeterministicSolverConfig {
             fast_eval_node_budget: 50_000,
             enable_dominance_pruning: true,
             enable_foundation_retreats: true,
-        }
-    }
-}
-
-/// Configuration for event-driven belief-state planning.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct BeliefPlannerConfig {
-    /// Default deterministic corridor depth in macro moves.
-    pub corridor_depth: u8,
-    /// Whether first-reveal branches are always enumerated exactly.
-    pub exact_first_reveal: bool,
-    /// Maximum number of root actions eligible for second-reveal expansion.
-    pub max_second_reveal_actions: usize,
-    /// Root action value gap below which second-reveal refinement is considered.
-    pub second_reveal_gap_threshold: f32,
-    /// Uncertainty threshold above which second-reveal refinement is considered.
-    pub second_reveal_uncertainty_threshold: f32,
-    /// UCB/PUCT-style exploration constant for future planner selection.
-    pub exploration_constant: f32,
-}
-
-impl Default for BeliefPlannerConfig {
-    fn default() -> Self {
-        Self {
-            corridor_depth: 8,
-            exact_first_reveal: true,
-            max_second_reveal_actions: 2,
-            second_reveal_gap_threshold: 0.03,
-            second_reveal_uncertainty_threshold: 0.05,
-            exploration_constant: 1.25,
-        }
-    }
-}
-
-/// Configuration for exact hidden-assignment search in late-game positions.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct LateExactConfig {
-    /// Enables the exact-assignment regime switch.
-    pub enabled: bool,
-    /// Maximum number of hidden tableau cards for late-exact mode.
-    pub hidden_card_threshold: u8,
-    /// Optional cap on enumerated hidden assignments.
-    pub assignment_budget: Option<u64>,
-}
-
-impl Default for LateExactConfig {
-    fn default() -> Self {
-        Self {
-            enabled: true,
-            hidden_card_threshold: 8,
-            assignment_budget: None,
+            enable_tt: true,
+            tt_capacity: 65_536,
+            tt_store_approx: true,
         }
     }
 }

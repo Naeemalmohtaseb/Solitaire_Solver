@@ -11,10 +11,11 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     cards::{Card, Rank},
-    core::VisibleState,
+    core::{FullState, VisibleState},
     moves::{
-        apply_atomic_move, generate_legal_macro_moves_with_config, requires_reveal, AtomicMove,
-        MacroMove, MacroMoveKind, MoveGenerationConfig, MoveOutcome, MoveSemantics,
+        apply_atomic_move, apply_atomic_move_full_state, generate_legal_macro_moves_with_config,
+        requires_reveal, AtomicMove, FullStateMoveUndo, MacroMove, MacroMoveKind,
+        MoveGenerationConfig, MoveOutcome, MoveSemantics,
     },
     types::MoveId,
 };
@@ -187,6 +188,121 @@ impl ClosureEngine {
                 return ClosureResult::new(
                     state,
                     transcript,
+                    ClosureStopReason::RevealOccurred,
+                    revealed_any,
+                );
+            }
+        }
+    }
+
+    /// Runs closure on a full deterministic state and returns undo records for
+    /// every automatic step.
+    pub fn run_full_state_with_undos(&self, full_state: &mut FullState) -> FullClosureRun {
+        let mut transcript = ClosureTranscript::default();
+        let mut undos = Vec::new();
+        let mut revealed_any = false;
+
+        loop {
+            if self.config.debug_validate_each_step && full_state.debug_validate().is_err() {
+                return FullClosureRun::new(
+                    &full_state.visible,
+                    transcript,
+                    undos,
+                    ClosureStopReason::NoSafeClosureMove,
+                    revealed_any,
+                );
+            }
+
+            if full_state.visible.is_structural_win() {
+                return FullClosureRun::new(
+                    &full_state.visible,
+                    transcript,
+                    undos,
+                    ClosureStopReason::TerminalWin,
+                    revealed_any,
+                );
+            }
+
+            let macro_moves = generate_legal_macro_moves_with_config(
+                &full_state.visible,
+                MoveGenerationConfig {
+                    allow_foundation_retreats: true,
+                },
+            );
+
+            if macro_moves.is_empty() {
+                return FullClosureRun::new(
+                    &full_state.visible,
+                    transcript,
+                    undos,
+                    ClosureStopReason::TerminalNoMoves,
+                    revealed_any,
+                );
+            }
+
+            if transcript.len() >= usize::from(self.config.max_corridor_steps) {
+                return FullClosureRun::new(
+                    &full_state.visible,
+                    transcript,
+                    undos,
+                    ClosureStopReason::CorridorDepthLimit,
+                    revealed_any,
+                );
+            }
+
+            let candidate = match self.select_candidate(&full_state.visible, &macro_moves) {
+                CandidateDecision::Apply(candidate) => candidate,
+                CandidateDecision::Stop(stop_reason) => {
+                    return FullClosureRun::new(
+                        &full_state.visible,
+                        transcript,
+                        undos,
+                        stop_reason,
+                        revealed_any,
+                    );
+                }
+            };
+
+            let transition =
+                match apply_atomic_move_full_state(full_state, candidate.macro_move.atomic) {
+                    Ok(transition) => transition,
+                    Err(_) => {
+                        return FullClosureRun::new(
+                            &full_state.visible,
+                            transcript,
+                            undos,
+                            ClosureStopReason::NoSafeClosureMove,
+                            revealed_any,
+                        );
+                    }
+                };
+
+            let revealed_step = transition.outcome.revealed.is_some();
+            revealed_any |= revealed_step;
+            undos.push(transition.undo);
+            transcript.push(ClosureStep {
+                move_id: candidate.macro_move.id,
+                macro_move: candidate.macro_move,
+                reason: candidate.reason,
+                semantics: transition.outcome.semantics,
+                outcome: transition.outcome,
+            });
+
+            if self.config.debug_validate_each_step && full_state.debug_validate().is_err() {
+                return FullClosureRun::new(
+                    &full_state.visible,
+                    transcript,
+                    undos,
+                    ClosureStopReason::NoSafeClosureMove,
+                    revealed_any,
+                );
+            }
+
+            if revealed_step && self.config.stop_on_reveal {
+                return FullClosureRun::new(
+                    &full_state.visible,
+                    transcript,
+                    undos,
                     ClosureStopReason::RevealOccurred,
                     revealed_any,
                 );
@@ -390,6 +506,30 @@ impl ClosureResult {
             branching_remaining: matches!(stop_reason, ClosureStopReason::MeaningfulBranching),
             empty_column_pivot: matches!(stop_reason, ClosureStopReason::EmptyColumnDecision),
             stock_pivot: matches!(stop_reason, ClosureStopReason::StockPivot),
+        }
+    }
+}
+
+/// Full-state closure result plus undo records for search recursion.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FullClosureRun {
+    /// Diagnostic closure result over the visible state.
+    pub result: ClosureResult,
+    /// Full-state undo records, one per transcript step.
+    pub undos: Vec<FullStateMoveUndo>,
+}
+
+impl FullClosureRun {
+    fn new(
+        state: &VisibleState,
+        transcript: ClosureTranscript,
+        undos: Vec<FullStateMoveUndo>,
+        stop_reason: ClosureStopReason,
+        revealed: bool,
+    ) -> Self {
+        Self {
+            result: ClosureResult::new(state, transcript, stop_reason, revealed),
+            undos,
         }
     }
 }

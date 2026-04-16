@@ -90,6 +90,47 @@ impl HiddenAssignments {
         self.entries.iter()
     }
 
+    /// Returns the assignment for a hidden slot.
+    pub fn assignment_for_slot(&self, slot: HiddenSlot) -> Option<HiddenAssignment> {
+        self.entries
+            .binary_search_by_key(&slot, |entry| entry.slot)
+            .ok()
+            .map(|index| self.entries[index])
+    }
+
+    /// Returns the card assigned to a hidden slot.
+    pub fn card_for_slot(&self, slot: HiddenSlot) -> Option<Card> {
+        self.assignment_for_slot(slot)
+            .map(|assignment| assignment.card)
+    }
+
+    /// Removes and returns the assignment for a hidden slot.
+    pub fn remove_slot(&mut self, slot: HiddenSlot) -> SolverResult<HiddenAssignment> {
+        let index = self
+            .entries
+            .binary_search_by_key(&slot, |entry| entry.slot)
+            .map_err(|_| {
+                SolverError::InvalidState(format!("missing hidden assignment for slot {slot}"))
+            })?;
+        Ok(self.entries.remove(index))
+    }
+
+    /// Inserts one assignment while preserving deterministic slot order.
+    pub fn insert(&mut self, assignment: HiddenAssignment) -> SolverResult<()> {
+        match self
+            .entries
+            .binary_search_by_key(&assignment.slot, |entry| entry.slot)
+        {
+            Ok(_) => Err(SolverError::DuplicateHiddenSlot(
+                assignment.slot.to_string(),
+            )),
+            Err(index) => {
+                self.entries.insert(index, assignment);
+                self.validate_structure()
+            }
+        }
+    }
+
     /// Validates local assignment structure.
     pub fn validate_structure(&self) -> SolverResult<()> {
         let mut card_mask = 0u64;
@@ -221,5 +262,26 @@ mod tests {
             assignments.validate_structure(),
             Err(SolverError::DuplicateHiddenSlot(slot)) if slot == duplicate_slot.to_string()
         ));
+    }
+
+    #[test]
+    fn hidden_assignments_lookup_remove_and_insert_by_slot() {
+        let c0 = ColumnId::new(0).unwrap();
+        let slot0 = HiddenSlot::new(c0, 0);
+        let slot1 = HiddenSlot::new(c0, 1);
+        let mut assignments = HiddenAssignments::new(vec![
+            HiddenAssignment::new(slot1, "2c".parse().unwrap()),
+            HiddenAssignment::new(slot0, "Ac".parse().unwrap()),
+        ]);
+
+        assert_eq!(assignments.card_for_slot(slot0).unwrap().to_string(), "Ac");
+
+        let removed = assignments.remove_slot(slot0).unwrap();
+        assert_eq!(removed.slot, slot0);
+        assert!(assignments.card_for_slot(slot0).is_none());
+
+        assignments.insert(removed).unwrap();
+        assert_eq!(assignments.entries[0].slot, slot0);
+        assert_eq!(assignments.entries[1].slot, slot1);
     }
 }

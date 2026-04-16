@@ -114,6 +114,10 @@ pub enum SolverError {
     #[error("unsupported operation: {0}")]
     Unsupported(&'static str),
 
+    /// Machine-readable benchmark/report serialization failed.
+    #[error("serialization failed: {0}")]
+    Serialization(String),
+
     /// Persistence or file-system failure.
     #[error(transparent)]
     Io(#[from] std::io::Error),

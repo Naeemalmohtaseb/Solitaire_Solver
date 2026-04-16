@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     cards::{Card, Rank, Suit},
-    core::{TableauColumn, VisibleState},
+    core::{FullState, HiddenAssignment, HiddenSlot, TableauColumn, VisibleState},
     error::{SolverError, SolverResult},
     types::{ColumnId, MoveId, TABLEAU_COLUMN_COUNT},
 };
@@ -300,6 +300,24 @@ pub struct MoveTransition {
     pub undo: MoveUndo,
 }
 
+/// Full-state undo record for a move that may reveal a concrete hidden card.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FullStateMoveUndo {
+    /// Visible-state undo record from the move engine.
+    pub visible_undo: MoveUndo,
+    /// Hidden assignment removed because the move auto-revealed a card.
+    pub revealed_assignment: Option<HiddenAssignment>,
+}
+
+/// Applied full-state transition with visible outcome and hidden-assignment undo.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FullStateMoveTransition {
+    /// Diagnostic transition outcome.
+    pub outcome: MoveOutcome,
+    /// Undo record that restores both visible state and hidden assignments.
+    pub undo: FullStateMoveUndo,
+}
+
 /// Generates legal atomic moves with default move-generation config.
 pub fn generate_legal_atomic_moves(state: &VisibleState) -> Vec<AtomicMove> {
     generate_legal_atomic_moves_with_config(state, MoveGenerationConfig::default())
@@ -448,6 +466,108 @@ pub fn undo_atomic_move(state: &mut VisibleState, undo: MoveUndo) -> SolverResul
     }
 
     state.validate_consistency()
+}
+
+/// Returns the hidden slot that would be revealed by a legal visible move.
+pub fn next_hidden_slot_to_reveal(state: &VisibleState, atomic: AtomicMove) -> Option<HiddenSlot> {
+    let column = match atomic {
+        AtomicMove::TableauToFoundation { src } => {
+            let tableau = &state.columns[column_index(src)];
+            (tableau.face_up_len() == 1 && tableau.hidden_count > 0).then_some(src)
+        }
+        AtomicMove::TableauToTableau { src, run_start, .. } => {
+            let tableau = &state.columns[column_index(src)];
+            (run_start == 0 && !tableau.face_up.is_empty() && tableau.hidden_count > 0)
+                .then_some(src)
+        }
+        _ => None,
+    }?;
+
+    Some(HiddenSlot::new(
+        column,
+        state.columns[column_index(column)].hidden_count - 1,
+    ))
+}
+
+/// Returns the concrete card that a full-state move would reveal.
+pub fn revealed_card_for_move(
+    full_state: &FullState,
+    atomic: AtomicMove,
+) -> SolverResult<Option<Card>> {
+    match next_hidden_slot_to_reveal(&full_state.visible, atomic) {
+        Some(slot) => full_state
+            .hidden_assignments
+            .card_for_slot(slot)
+            .map(Some)
+            .ok_or_else(|| {
+                SolverError::InvalidState(format!(
+                    "missing hidden assignment for reveal slot {slot}"
+                ))
+            }),
+        None => Ok(None),
+    }
+}
+
+/// Applies an atomic move to a full deterministic state.
+///
+/// Reveal identities are read from `hidden_assignments`, then removed after the
+/// visible transition succeeds. This keeps perfect-information search aligned
+/// with the visible move engine's reveal contract.
+pub fn apply_atomic_move_full_state(
+    full_state: &mut FullState,
+    atomic: AtomicMove,
+) -> SolverResult<FullStateMoveTransition> {
+    let reveal_slot = next_hidden_slot_to_reveal(&full_state.visible, atomic);
+    let revealed_assignment = match reveal_slot {
+        Some(slot) => Some(
+            full_state
+                .hidden_assignments
+                .assignment_for_slot(slot)
+                .ok_or_else(|| {
+                    SolverError::InvalidState(format!(
+                        "missing hidden assignment for reveal slot {slot}"
+                    ))
+                })?,
+        ),
+        None => None,
+    };
+
+    let visible_transition = apply_atomic_move(
+        &mut full_state.visible,
+        atomic,
+        revealed_assignment.map(|assignment| assignment.card),
+    )?;
+
+    let removed_assignment = match revealed_assignment {
+        Some(assignment) => {
+            let removed = full_state.hidden_assignments.remove_slot(assignment.slot)?;
+            debug_assert_eq!(removed, assignment);
+            Some(removed)
+        }
+        None => None,
+    };
+
+    full_state.debug_validate()?;
+
+    Ok(FullStateMoveTransition {
+        outcome: visible_transition.outcome,
+        undo: FullStateMoveUndo {
+            visible_undo: visible_transition.undo,
+            revealed_assignment: removed_assignment,
+        },
+    })
+}
+
+/// Undoes a full deterministic move.
+pub fn undo_atomic_move_full_state(
+    full_state: &mut FullState,
+    undo: FullStateMoveUndo,
+) -> SolverResult<()> {
+    undo_atomic_move(&mut full_state.visible, undo.visible_undo)?;
+    if let Some(assignment) = undo.revealed_assignment {
+        full_state.hidden_assignments.insert(assignment)?;
+    }
+    full_state.validate_consistency()
 }
 
 fn apply_atomic_move_inner(
@@ -932,6 +1052,7 @@ fn column_index(column: ColumnId) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::HiddenAssignments;
     use crate::stock::CyclicStockState;
 
     fn col(index: u8) -> ColumnId {
@@ -1154,6 +1275,46 @@ mod tests {
             }
         ));
         assert!(!requires_reveal(&state, AtomicMove::StockAdvance));
+    }
+
+    #[test]
+    fn full_state_reveal_lookup_handles_whole_multi_card_runs() {
+        let mut visible = VisibleState::default();
+        visible.columns[0] = TableauColumn::new(1, vec![card("6h"), card("5s")]);
+        visible.columns[1] = TableauColumn::new(0, vec![card("7s")]);
+        let used = [card("Ac"), card("6h"), card("5s"), card("7s")];
+        let stock_cards = (0..Card::COUNT)
+            .map(|index| Card::new(index as u8).unwrap())
+            .filter(|candidate| !used.contains(candidate))
+            .collect();
+        visible.stock = CyclicStockState::new(stock_cards, None, 0, None, 3);
+        let mut full_state = FullState::new(
+            visible,
+            HiddenAssignments::new(vec![HiddenAssignment::new(
+                HiddenSlot::new(col(0), 0),
+                card("Ac"),
+            )]),
+        );
+
+        let transition = apply_atomic_move_full_state(
+            &mut full_state,
+            AtomicMove::TableauToTableau {
+                src: col(0),
+                dest: col(1),
+                run_start: 0,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            transition.outcome.revealed,
+            Some(RevealRecord {
+                column: col(0),
+                card: card("Ac"),
+            })
+        );
+        assert_eq!(full_state.visible.columns[0].face_up, vec![card("Ac")]);
+        assert!(full_state.hidden_assignments.is_empty());
     }
 
     #[test]
