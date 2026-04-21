@@ -1,0 +1,15 @@
+[package]
+name = "solitaire-workbench"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+solver_core = { path = "../solver_core" }
+
+[[bin]]
+name = "solitaire-workbench"
+path = "src/main.rs"
+

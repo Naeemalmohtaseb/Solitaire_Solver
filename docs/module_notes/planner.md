@@ -70,7 +70,10 @@ Root search now has three conservative control layers:
   introduced. After workers finish, only root action statistics are merged:
   visits, means, M2/variance, win-like counts, reveal-frontier coverage, and
   diagnostics. Late-exact evaluation, when eligible, runs once after aggregation
-  for the top merged root actions.
+  for the top merged root actions. CLI benchmark commands can override these
+  controls with `--root-parallel`, `--root-workers`, `--worker-sim-budget`, and
+  `--worker-seed-stride`; those flags are runtime overlays on top of presets,
+  not separate planner behavior.
 
 This reuse is intentionally not a large persistent belief-state transposition
 table. It is bounded root/near-root metadata for session continuation and

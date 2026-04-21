@@ -78,24 +78,60 @@ pub struct EvaluatorWeights {
     pub foundation_progress: f32,
     /// Weight for having revealed hidden tableau cards.
     pub hidden_cards_revealed: f32,
+    /// Weight for currently available reveal-causing moves.
+    pub reveal_potential: f32,
+    /// Weight for clearly safe low-rank foundation moves currently available.
+    pub safe_foundation_moves: f32,
     /// Weight for empty tableau columns.
     pub empty_columns: f32,
-    /// Weight for legal macro-move mobility.
+    /// Weight for productive legal macro-move mobility.
     pub mobility: f32,
     /// Weight for having an accessible waste card.
     pub waste_access: f32,
+    /// Penalty weight for low-information tableau churn in the legal move set.
+    pub churn_penalty: f32,
 }
 
 impl Default for EvaluatorWeights {
     fn default() -> Self {
         Self {
-            foundation_progress: 0.60,
-            hidden_cards_revealed: 0.15,
-            empty_columns: 0.10,
-            mobility: 0.10,
+            foundation_progress: 0.62,
+            hidden_cards_revealed: 0.24,
+            reveal_potential: 0.12,
+            safe_foundation_moves: 0.04,
+            empty_columns: 0.06,
+            mobility: 0.05,
             waste_access: 0.05,
+            churn_penalty: 0.12,
         }
     }
+}
+
+/// Explainable strategic ordering score for one legal macro move.
+///
+/// This is intentionally not pruning. It only biases deterministic move order,
+/// fast one-ply recommendations, and diagnostic explanations toward moves that
+/// increase information or durable progress.
+#[derive(Debug, Copy, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StrategicMoveScore {
+    /// Final integer score. Higher orders earlier.
+    pub total: i16,
+    /// Bonus for uncovering a hidden tableau card.
+    pub reveal_bonus: i16,
+    /// Bonus for moving clearly safe low-rank cards to foundation.
+    pub safe_foundation_bonus: i16,
+    /// Bonus for other foundation progress.
+    pub foundation_progress_bonus: i16,
+    /// Bonus for using or improving stock/waste access.
+    pub stock_access_bonus: i16,
+    /// Bonus for creating or using an empty column in a useful way.
+    pub empty_column_bonus: i16,
+    /// Bonus for exposing a buried face-up tableau card.
+    pub unblock_bonus: i16,
+    /// Penalty for low-information tableau rearrangement.
+    pub churn_penalty: i16,
+    /// Penalty for undoing foundation progress.
+    pub foundation_retreat_penalty: i16,
 }
 
 /// Deterministic transposition-table controls.
@@ -907,13 +943,15 @@ pub fn ordered_macro_moves_with_hint(
             allow_foundation_retreats: config.allow_foundation_retreats,
         },
     );
-    moves.sort_by_key(|macro_move| {
-        (
-            tt_best_move.is_none_or(|hint| !same_macro_action(hint, macro_move)) as u8,
-            move_order_bucket(state, macro_move),
-            macro_move.kind,
-            macro_move.id,
-        )
+    moves.sort_by(|left, right| {
+        let left_score = strategic_move_score(state, left);
+        let right_score = strategic_move_score(state, right);
+        (tt_best_move.is_none_or(|hint| !same_macro_action(hint, left)) as u8)
+            .cmp(&(tt_best_move.is_none_or(|hint| !same_macro_action(hint, right)) as u8))
+            .then_with(|| right_score.total.cmp(&left_score.total))
+            .then_with(|| move_order_bucket(state, left).cmp(&move_order_bucket(state, right)))
+            .then_with(|| left.kind.cmp(&right.kind))
+            .then_with(|| left.id.cmp(&right.id))
     });
     moves
 }
@@ -953,25 +991,122 @@ fn move_order_bucket(state: &VisibleState, macro_move: &MacroMove) -> u8 {
     {
         return 1;
     }
-    if macro_move.semantics.creates_empty_column || macro_move.semantics.fills_empty_column {
+    if macro_move.semantics.moves_to_foundation {
         return 2;
     }
-    if matches!(macro_move.kind, MacroMoveKind::PlayWasteToTableau { .. }) {
+    if macro_move.semantics.creates_empty_column || macro_move.semantics.fills_empty_column {
         return 3;
+    }
+    if matches!(macro_move.kind, MacroMoveKind::PlayWasteToTableau { .. }) {
+        return 4;
     }
     if matches!(
         macro_move.kind,
         MacroMoveKind::MoveRun { .. } | MacroMoveKind::PlaceKingRun { .. }
     ) {
-        return 4;
-    }
-    if macro_move.semantics.affects_stock_cycle {
         return 5;
     }
-    if macro_move.semantics.moves_from_foundation {
+    if macro_move.semantics.affects_stock_cycle {
         return 6;
     }
-    7
+    if macro_move.semantics.moves_from_foundation {
+        return 7;
+    }
+    8
+}
+
+/// Returns an explainable strategic score for a legal macro move.
+pub fn strategic_move_score(state: &VisibleState, macro_move: &MacroMove) -> StrategicMoveScore {
+    let mut score = StrategicMoveScore::default();
+
+    if macro_move.semantics.causes_reveal {
+        score.reveal_bonus = 1_000;
+    }
+
+    if macro_move.semantics.moves_to_foundation {
+        match foundation_move_card(state, macro_move).map(|card| card.rank()) {
+            Some(Rank::Ace | Rank::Two) => score.safe_foundation_bonus = 900,
+            Some(_) => score.foundation_progress_bonus = 260,
+            None => {}
+        }
+    }
+
+    match macro_move.atomic {
+        AtomicMove::WasteToFoundation => {
+            score.stock_access_bonus += 220;
+        }
+        AtomicMove::WasteToTableau { .. } => {
+            score.stock_access_bonus += 140;
+        }
+        AtomicMove::StockAdvance => {
+            score.stock_access_bonus += 90;
+        }
+        AtomicMove::StockRecycle => {
+            score.stock_access_bonus += 70;
+        }
+        AtomicMove::TableauToTableau {
+            src,
+            dest,
+            run_start,
+        } => {
+            if run_start > 0 {
+                score.unblock_bonus += 70;
+            }
+            if macro_move.semantics.creates_empty_column {
+                score.empty_column_bonus += if has_empty_column(state) { 70 } else { 150 };
+            }
+            if macro_move.semantics.fills_empty_column {
+                let src_col = &state.columns[usize::from(src.index())];
+                let moved_len = src_col.face_up_len().saturating_sub(run_start);
+                score.empty_column_bonus += if moved_len > 1 { 110 } else { 75 };
+                if state.columns[usize::from(dest.index())].is_empty()
+                    && macro_move.semantics.causes_reveal
+                {
+                    score.empty_column_bonus += 60;
+                }
+            }
+            if is_low_information_tableau_shuffle(macro_move, run_start) {
+                score.churn_penalty -= if run_start == 0 { 350 } else { 120 };
+            }
+        }
+        AtomicMove::FoundationToTableau { .. } => {
+            score.foundation_retreat_penalty = -520;
+        }
+        AtomicMove::TableauToFoundation { src } => {
+            if macro_move.semantics.creates_empty_column {
+                score.empty_column_bonus += if has_empty_column(state) { 50 } else { 90 };
+            }
+            let src_col = &state.columns[usize::from(src.index())];
+            if src_col.hidden_count > 0 {
+                score.unblock_bonus += 80;
+            }
+        }
+    }
+
+    score.total = score
+        .reveal_bonus
+        .saturating_add(score.safe_foundation_bonus)
+        .saturating_add(score.foundation_progress_bonus)
+        .saturating_add(score.stock_access_bonus)
+        .saturating_add(score.empty_column_bonus)
+        .saturating_add(score.unblock_bonus)
+        .saturating_add(score.churn_penalty)
+        .saturating_add(score.foundation_retreat_penalty);
+    score
+}
+
+fn has_empty_column(state: &VisibleState) -> bool {
+    state.columns.iter().any(|column| column.is_empty())
+}
+
+fn is_low_information_tableau_shuffle(macro_move: &MacroMove, run_start: usize) -> bool {
+    matches!(macro_move.atomic, AtomicMove::TableauToTableau { .. })
+        && !macro_move.semantics.causes_reveal
+        && !macro_move.semantics.creates_empty_column
+        && !macro_move.semantics.fills_empty_column
+        && !macro_move.semantics.moves_to_foundation
+        && !macro_move.semantics.affects_stock_cycle
+        && run_start <= 1
 }
 
 fn foundation_move_card(state: &VisibleState, macro_move: &MacroMove) -> Option<Card> {
@@ -991,28 +1126,70 @@ fn evaluate_state(state: &VisibleState, weights: EvaluatorWeights) -> f32 {
 
     let foundation = state.foundations.card_count() as f32 / Card::COUNT as f32;
     let hidden_revealed = 1.0 - (state.hidden_slot_count().min(21) as f32 / 21.0);
-    let empty_columns = state
+    let raw_empty_columns = state
         .columns
         .iter()
         .filter(|column| column.is_empty())
         .count() as f32
         / crate::types::TABLEAU_COLUMN_COUNT as f32;
-    let mobility = (generate_legal_macro_moves_with_config(
+    let moves = generate_legal_macro_moves_with_config(
         state,
         MoveGenerationConfig {
             allow_foundation_retreats: true,
         },
-    )
-    .len()
-    .min(20) as f32)
-        / 20.0;
-    let waste_access = f32::from(state.stock.accessible_card().is_some());
+    );
+    let mut productive_moves = 0usize;
+    let mut churn_moves = 0usize;
+    let mut reveal_moves = 0usize;
+    let mut safe_foundation_moves = 0usize;
+    let mut useful_empty_moves = 0usize;
+    let mut stock_access_moves = 0usize;
+    for macro_move in &moves {
+        let score = strategic_move_score(state, macro_move);
+        if score.reveal_bonus > 0 {
+            reveal_moves += 1;
+        }
+        if score.safe_foundation_bonus > 0 {
+            safe_foundation_moves += 1;
+        }
+        if score.empty_column_bonus > 0 {
+            useful_empty_moves += 1;
+        }
+        if score.stock_access_bonus > 0 {
+            stock_access_moves += 1;
+        }
+        if score.churn_penalty < 0 {
+            churn_moves += 1;
+        }
+        if score.total > 0 && score.churn_penalty == 0 {
+            productive_moves += 1;
+        }
+    }
+
+    let reveal_potential = (reveal_moves.min(4) as f32) / 4.0;
+    let safe_foundation = (safe_foundation_moves.min(4) as f32) / 32.0;
+    let useful_empty_columns =
+        (raw_empty_columns + (useful_empty_moves.min(4) as f32 / 16.0)).clamp(0.0, 1.0);
+    let mobility = (productive_moves.min(12) as f32) / 12.0;
+    let stock_access = (f32::from(state.stock.accessible_card().is_some()) * 0.55
+        + f32::from(state.stock.can_advance()) * 0.25
+        + f32::from(state.stock.can_recycle()) * 0.10
+        + (stock_access_moves.min(4) as f32 / 40.0))
+        .clamp(0.0, 1.0);
+    let churn = if moves.is_empty() {
+        0.0
+    } else {
+        (churn_moves as f32 / moves.len() as f32).clamp(0.0, 1.0)
+    };
 
     (foundation * weights.foundation_progress
         + hidden_revealed * weights.hidden_cards_revealed
-        + empty_columns * weights.empty_columns
+        + reveal_potential * weights.reveal_potential
+        + safe_foundation * weights.safe_foundation_moves
+        + useful_empty_columns * weights.empty_columns
         + mobility * weights.mobility
-        + waste_access * weights.waste_access)
+        + stock_access * weights.waste_access
+        - churn * weights.churn_penalty)
         .clamp(0.0, 1.0)
 }
 

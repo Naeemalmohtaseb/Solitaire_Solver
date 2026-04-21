@@ -1,0 +1,296 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Solitaire Workbench</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <div id="app">
+      <header class="topbar">
+        <div>
+          <h1>Solitaire Workbench</h1>
+          <p id="loaded-label">No file loaded</p>
+        </div>
+        <div class="backend-pill" id="backend-status">Starting...</div>
+        <div class="quick-actions">
+          <button id="quick-new-game">New Game</button>
+          <button id="quick-open">Open</button>
+          <button id="quick-save">Save Session</button>
+          <button id="quick-recommend">Recommend Move</button>
+          <button id="quick-autoplay">Run Autoplay</button>
+          <button id="quick-benchmark">Run Benchmark</button>
+        </div>
+      </header>
+
+      <div class="shell">
+        <nav class="sidebar" aria-label="Workbench tabs">
+          <button class="nav-item active" data-tab="replay">Replay</button>
+          <button class="nav-item" data-tab="solve">Solve</button>
+          <button class="nav-item" data-tab="benchmark">Benchmark</button>
+          <button class="nav-item" data-tab="diagnostics">Diagnostics</button>
+          <button class="nav-item" data-tab="settings">Settings</button>
+          <button class="nav-item muted" data-tab="future">Regression</button>
+          <button class="nav-item muted" data-tab="future">Oracle</button>
+          <button class="nav-item muted" data-tab="future">Datasets / ML</button>
+        </nav>
+
+        <main class="main">
+          <section class="tab-panel active" id="tab-replay">
+            <div class="section-head">
+              <div>
+                <h2>Replay</h2>
+                <p>Step through a saved session or autoplay trace.</p>
+              </div>
+              <div class="row">
+                <label class="file-button">
+                  Load session
+                  <input id="session-file" type="file" accept=".json,application/json" />
+                </label>
+                <button id="export-trace">Export trace JSON</button>
+              </div>
+            </div>
+            <div id="replay-board" class="board empty-board">Load a session JSON to begin.</div>
+            <div class="replay-controls">
+              <button id="first-step">First</button>
+              <button id="prev-step">Previous</button>
+              <button id="next-step">Next</button>
+              <button id="last-step">Last</button>
+            </div>
+            <div class="annotation" id="move-annotation">No move selected.</div>
+          </section>
+
+          <section class="tab-panel" id="tab-solve">
+            <div class="section-head">
+              <div>
+                <h2>Solve</h2>
+                <p>Generate a seeded game or ask the current backend for the next move.</p>
+              </div>
+              <div class="row">
+                <button id="solve-recommend">Recommend Next Move</button>
+                <button id="solve-one-step">Solve One Step</button>
+                <button id="solve-run-end">Run To End</button>
+              </div>
+            </div>
+            <div class="setup-panel">
+              <div class="section-head compact">
+                <div>
+                  <h3>Game Setup</h3>
+                  <p>Create a fresh deterministic deal from a seed.</p>
+                </div>
+                <div class="row">
+                  <button id="generate-game" class="primary">Generate Game</button>
+                  <button id="generate-autoplay">Generate + Autoplay</button>
+                </div>
+              </div>
+              <div class="form-grid">
+                <label>Seed
+                  <input id="new-seed" type="number" min="0" value="0" />
+                </label>
+                <label>Preset
+                  <select id="new-preset"></select>
+                </label>
+                <label>Backend
+                  <select id="new-backend">
+                    <option value="belief_uct_late_exact">Belief UCT + Late Exact</option>
+                    <option value="belief_uct">Belief UCT</option>
+                    <option value="pimc">PIMC baseline</option>
+                  </select>
+                </label>
+                <label>Max steps
+                  <input id="new-max-steps" type="number" min="0" value="50" />
+                </label>
+                <label><span>Root parallel</span>
+                  <span class="inline-control"><input id="new-root-parallel" type="checkbox" /> Enabled</span>
+                </label>
+                <label>Workers
+                  <input id="new-workers" type="number" min="1" value="2" />
+                </label>
+                <label>Worker sim budget
+                  <input id="new-worker-budget" type="number" min="1" value="8" />
+                </label>
+                <label>V-Net model path
+                  <input id="new-vnet" placeholder="models/best_vnet_inference.json" />
+                </label>
+              </div>
+            </div>
+            <div id="solve-board" class="board empty-board">Load a session from Replay first.</div>
+            <div id="recommendation-output" class="output-box">No recommendation yet.</div>
+          </section>
+
+          <section class="tab-panel" id="tab-benchmark">
+            <div class="section-head">
+              <div>
+                <h2>Benchmark</h2>
+                <p>Run autoplay and preset comparisons through structured backend commands.</p>
+              </div>
+              <button id="start-benchmark">Start benchmark</button>
+            </div>
+            <div class="form-grid">
+              <label>Benchmark type
+                <select id="bench-type">
+                  <option value="autoplay">Autoplay benchmark</option>
+                  <option value="compare">Compare</option>
+                  <option value="repeated_compare">Repeated compare</option>
+                  <option value="compare_presets">Compare presets</option>
+                </select>
+              </label>
+              <label>Preset
+                <select id="bench-preset"></select>
+              </label>
+              <label>Baseline
+                <select id="bench-baseline"></select>
+              </label>
+              <label>Candidate
+                <select id="bench-candidate"></select>
+              </label>
+              <label>Compare-presets list
+                <input id="bench-presets" placeholder="fast_benchmark,balanced_benchmark" />
+              </label>
+              <label>Games
+                <input id="bench-games" type="number" min="1" value="5" />
+              </label>
+              <label>Repetitions
+                <input id="bench-repetitions" type="number" min="1" value="3" />
+              </label>
+              <label>Seed
+                <input id="bench-seed" type="number" min="0" value="0" />
+              </label>
+              <label>Max steps
+                <input id="bench-max-steps" type="number" min="0" value="20" />
+              </label>
+              <label>Rank by
+                <select id="bench-rank">
+                  <option value="efficiency">Efficiency</option>
+                  <option value="win_rate">Win rate</option>
+                  <option value="time">Time</option>
+                </select>
+              </label>
+            </div>
+            <div class="progress-panel">
+              <h3>Live progress</h3>
+              <div id="progress-line">No benchmark running.</div>
+            </div>
+            <div class="output-box">
+              <div class="row">
+                <button id="export-bench-json">Export JSON</button>
+                <button id="export-bench-csv">Export CSV</button>
+                <button id="export-game-csv">Export game CSV</button>
+              </div>
+              <div id="benchmark-output">No benchmark result yet.</div>
+            </div>
+          </section>
+
+          <section class="tab-panel" id="tab-diagnostics">
+            <div class="section-head">
+              <div>
+                <h2>Diagnostics</h2>
+                <p>Audit replay consistency, reveals, terminal state, and suspicious decisions.</p>
+              </div>
+              <div class="row">
+                <button id="analyze-session" class="primary">Analyze Current Session</button>
+                <button id="export-diagnostics">Export diagnostics JSON</button>
+              </div>
+            </div>
+            <div class="diagnostic-summary" id="diagnostic-summary">
+              <div class="empty-panel">Load or generate a session, then run diagnostics.</div>
+            </div>
+            <div class="diagnostic-layout">
+              <div class="output-box">
+                <h3>Audited steps</h3>
+                <div id="diagnostic-step-list" class="diagnostic-step-list">No diagnostic report yet.</div>
+              </div>
+              <div class="output-box">
+                <h3>Terminal audit</h3>
+                <div id="terminal-audit">No diagnostic report yet.</div>
+                <h3>Action audit</h3>
+                <div id="action-audit">Select a diagnostic step.</div>
+              </div>
+            </div>
+          </section>
+
+          <section class="tab-panel" id="tab-settings">
+            <div class="section-head">
+              <div>
+                <h2>Settings</h2>
+                <p>Runtime settings map to existing solver configs and benchmark overrides.</p>
+              </div>
+            </div>
+            <div class="settings-grid">
+              <fieldset>
+                <legend>Planner</legend>
+                <label>Backend
+                  <select id="setting-backend">
+                    <option value="belief_uct_late_exact">Belief UCT + Late Exact</option>
+                    <option value="belief_uct">Belief UCT</option>
+                    <option value="pimc">PIMC baseline</option>
+                  </select>
+                </label>
+                <label>Preset
+                  <select id="setting-preset"></select>
+                </label>
+              </fieldset>
+              <fieldset>
+                <legend>Root Parallel</legend>
+                <label><input id="setting-root-parallel" type="checkbox" /> Enabled</label>
+                <label>Workers <input id="setting-workers" type="number" min="1" value="2" /></label>
+                <label>Worker sim budget <input id="setting-worker-budget" type="number" min="1" value="8" /></label>
+                <label>Seed stride <input id="setting-seed-stride" type="number" min="1" value="1000003" /></label>
+              </fieldset>
+              <fieldset>
+                <legend>Late Exact</legend>
+                <label><input id="setting-late-exact" type="checkbox" checked /> Enabled</label>
+              </fieldset>
+              <fieldset>
+                <legend>Leaf Evaluation / V-Net</legend>
+                <label>Leaf mode
+                  <select id="setting-leaf">
+                    <option value="heuristic">Heuristic</option>
+                    <option value="vnet">V-Net</option>
+                  </select>
+                </label>
+                <label>V-Net model path <input id="setting-vnet" placeholder="models/best_vnet_inference.json" /></label>
+              </fieldset>
+              <fieldset>
+                <legend>Progress / Output</legend>
+                <label><input id="setting-show-progress" type="checkbox" checked /> Show progress</label>
+                <p class="hint">Default folders: sessions, reports, data, models, regression, oracle.</p>
+              </fieldset>
+              <fieldset>
+                <legend>Debug / Diagnostics</legend>
+                <p class="hint">Diagnostic report emission is deferred. Core validation remains in the backend.</p>
+              </fieldset>
+            </div>
+          </section>
+
+          <section class="tab-panel" id="tab-future">
+            <h2>Coming later</h2>
+            <p>Regression, Oracle, and Datasets / ML are anticipated by the workbench shell and remain CLI/library-first in v1.</p>
+          </section>
+        </main>
+
+        <aside class="inspector">
+          <h2>Inspector</h2>
+          <dl>
+            <dt>Preset</dt><dd id="inspect-preset">n/a</dd>
+            <dt>Backend</dt><dd id="inspect-backend">n/a</dd>
+            <dt>Step</dt><dd id="inspect-step">0 / 0</dd>
+            <dt>Hidden count</dt><dd id="inspect-hidden">n/a</dd>
+            <dt>Move</dt><dd id="inspect-move">n/a</dd>
+            <dt>Reveal</dt><dd id="inspect-reveal">n/a</dd>
+            <dt>Stats</dt><dd id="inspect-stats">n/a</dd>
+          </dl>
+          <div class="inspector-actions">
+            <button id="inspect-load">Load session</button>
+            <button id="inspect-save">Save session</button>
+          </div>
+        </aside>
+      </div>
+
+      <footer class="statusbar" id="statusbar">Ready.</footer>
+    </div>
+
+    <script src="/app.js"></script>
+  </body>
+</html>

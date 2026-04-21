@@ -2,6 +2,7 @@
 members = [
     "crates/solver_core",
     "crates/cli",
+    "crates/workbench",
 ]
 resolver = "2"
 

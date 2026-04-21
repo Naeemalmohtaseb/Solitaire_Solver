@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     closure::ClosureConfig,
+    error::{SolverError, SolverResult},
     late_exact::LateExactConfig,
     ml::{LeafEvaluationMode, VNetInferenceConfig},
     planner::BeliefPlannerConfig,
@@ -36,6 +37,77 @@ impl Default for SolverConfig {
             late_exact: LateExactConfig::default(),
             experiments: ExperimentConfig::default(),
         }
+    }
+}
+
+/// Runtime override for root-parallel belief planner execution.
+///
+/// Presets define their normal planner behavior. This small overlay lets CLIs
+/// and benchmark harnesses explicitly enable/disable root-parallel execution
+/// and tune worker controls without mutating the preset definitions themselves.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RootParallelConfigOverride {
+    /// Explicit root-parallel enable/disable override.
+    pub enable_root_parallel: Option<bool>,
+    /// Override for the number of independent root workers.
+    pub root_workers: Option<usize>,
+    /// Override for per-worker simulation budget.
+    pub worker_simulation_budget: Option<usize>,
+    /// Override for the deterministic seed stride between workers.
+    pub worker_seed_stride: Option<u64>,
+}
+
+impl RootParallelConfigOverride {
+    /// Returns true when this override does not modify planner configuration.
+    pub const fn is_empty(&self) -> bool {
+        self.enable_root_parallel.is_none()
+            && self.root_workers.is_none()
+            && self.worker_simulation_budget.is_none()
+            && self.worker_seed_stride.is_none()
+    }
+
+    /// Applies this override to a full solver config.
+    pub fn apply_to_solver_config(&self, config: &mut SolverConfig) -> SolverResult<()> {
+        self.apply_to_belief_planner_config(&mut config.belief_planner)?;
+        if let Some(root_workers) = self.root_workers {
+            config.search.root_workers = root_workers;
+        }
+        Ok(())
+    }
+
+    /// Applies this override to belief planner controls.
+    pub fn apply_to_belief_planner_config(
+        &self,
+        config: &mut BeliefPlannerConfig,
+    ) -> SolverResult<()> {
+        if let Some(enabled) = self.enable_root_parallel {
+            config.enable_root_parallel = enabled;
+        }
+        if let Some(root_workers) = self.root_workers {
+            if root_workers == 0 {
+                return Err(SolverError::InvalidState(
+                    "root_workers override must be greater than zero".to_string(),
+                ));
+            }
+            config.root_workers = root_workers;
+        }
+        if let Some(worker_budget) = self.worker_simulation_budget {
+            if worker_budget == 0 {
+                return Err(SolverError::InvalidState(
+                    "worker_simulation_budget override must be greater than zero".to_string(),
+                ));
+            }
+            config.worker_simulation_budget = Some(worker_budget);
+        }
+        if let Some(seed_stride) = self.worker_seed_stride {
+            if seed_stride == 0 {
+                return Err(SolverError::InvalidState(
+                    "worker_seed_stride override must be greater than zero".to_string(),
+                ));
+            }
+            config.worker_seed_stride = seed_stride;
+        }
+        Ok(())
     }
 }
 

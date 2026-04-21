@@ -1,0 +1,4 @@
+ranking_metric,preset_name,backend,suite_name,base_seed,games,wins,losses,win_rate,avg_time_per_game_ms,avg_time_per_move_ms,avg_deterministic_nodes,avg_root_visits,late_exact_trigger_count,root_parallel_enabled,root_parallel_workers,root_parallel_worker_simulation_budget,leaf_eval_mode,vnet_model_path,vnet_inferences,vnet_fallbacks,vnet_inference_elapsed_us,win_rate_per_second,win_rate_rank,time_rank,efficiency_rank
+Efficiency,balanced_benchmark,BeliefUctLateExact,cli-compare-presets,100,10,0,10,0,1061,5.305,89864,23428,210,true,8,,Heuristic,,0,0,0,0,1,2,1
+Efficiency,fast_benchmark,BeliefUctLateExact,cli-compare-presets,100,10,0,10,0,41,0.5125,2588,1615.2,19,true,8,,Heuristic,,0,0,0,0,2,1,2
+Efficiency,quality_benchmark,BeliefUctLateExact,cli-compare-presets,100,10,0,10,0,6727.3,13.454600000000003,2032435.2,254054.4,0,true,8,,Heuristic,,0,0,0,0,3,3,3

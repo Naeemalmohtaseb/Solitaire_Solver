@@ -85,10 +85,16 @@ Belief UCT autoplay can also enable root-parallel mode through
 `BeliefPlannerConfig`. Root-parallel mode runs independent workers from the same
 public belief root, with deterministic seed offsets and worker simulation
 budgets, then aggregates only root action statistics. Benchmark reports include
-root-parallel step counts, average workers per game, and aggregate worker
-simulation counts. This is a latency/quality knob, not a new planner algorithm:
-non-reveal transitions, reveal-frontier handling, and leaf evaluation semantics
-are unchanged.
+the configured root-parallel enable bit, configured worker count, optional
+per-worker simulation budget, root-parallel step counts, average workers per
+game, and aggregate worker simulation counts. This is a latency/quality knob,
+not a new planner algorithm: non-reveal transitions, reveal-frontier handling,
+and leaf evaluation semantics are unchanged.
+
+The benchmark runners also accept an optional progress reporter. The default
+library path uses a no-op reporter, while the CLI prints coarse per-game updates
+for long autoplay, paired comparison, repeated comparison, and preset-comparison
+runs. Progress output is diagnostic only and does not feed back into the solver.
 
 Exports are machine-friendly and deterministic:
 
@@ -192,6 +198,30 @@ The `solitaire-cli benchmark` commands are thin wrappers around this library
 module. They use deterministic seed suites and the same preset names exposed by
 `experiment_preset_by_name`.
 
+For realistic timing, run benchmarks in release mode:
+
+```powershell
+cargo run --release -p solitaire-cli -- benchmark autoplay --preset balanced_benchmark --games 100 --seed 100
+```
+
+The CLI prints compact progress lines by default. Use `--no-progress` to silence
+them in scripts. Progress lines show the command kind, current preset/backend,
+optional preset or repetition index, completed games, partial wins/losses,
+elapsed time, and a simple ETA for the current suite segment.
+
+Root-parallel planner execution can be overridden at runtime without changing a
+preset:
+
+```powershell
+cargo run --release -p solitaire-cli -- benchmark autoplay --preset balanced_benchmark --games 100 --seed 100 --root-parallel --root-workers 4 --worker-sim-budget 64
+cargo run --release -p solitaire-cli -- benchmark compare-presets --presets fast_benchmark,balanced_benchmark --games 50 --seed 5 --root-parallel --root-workers 4 --no-progress
+```
+
+`--root-workers`, `--worker-sim-budget`, and `--worker-seed-stride` imply
+`--root-parallel` unless `--no-root-parallel` is supplied. Parallelism helps most
+when a root decision has enough simulation budget to amortize worker startup and
+aggregation; very small smoke runs may not get faster.
+
 Available presets:
 
 - `pimc_baseline`
@@ -208,6 +238,7 @@ Example commands:
 
 ```powershell
 cargo run -p solitaire-cli -- benchmark autoplay --preset fast_benchmark --games 25 --seed 100 --json reports/autoplay.json --csv reports/autoplay.csv --game-csv reports/autoplay-games.csv
+cargo run --release -p solitaire-cli -- benchmark autoplay --preset balanced_benchmark --games 100 --seed 100 --root-parallel --root-workers 4 --worker-sim-budget 64
 cargo run -p solitaire-cli -- benchmark compare --baseline pimc_baseline --candidate belief_uct_late_exact --games 25 --seed 100 --json reports/compare.json --csv reports/compare.csv
 cargo run -p solitaire-cli -- benchmark repeated-compare --baseline belief_uct_default --candidate belief_uct_late_exact --games 25 --repetitions 5 --seed 100 --json reports/repeated.json --csv reports/repeated.csv
 cargo run -p solitaire-cli -- benchmark compare-presets --presets fast_benchmark,balanced_benchmark,quality_benchmark --games 25 --seed 100 --rank-by efficiency --json reports/presets.json --csv reports/presets.csv

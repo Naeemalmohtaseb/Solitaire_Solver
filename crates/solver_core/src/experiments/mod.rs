@@ -11,6 +11,7 @@ mod calibration;
 mod oracle;
 mod pimc;
 mod presets;
+mod progress;
 mod regression;
 mod reporting;
 
@@ -21,6 +22,7 @@ pub use calibration::*;
 pub use oracle::*;
 pub use pimc::*;
 pub use presets::*;
+pub use progress::*;
 pub use regression::*;
 pub use reporting::*;
 
@@ -152,6 +154,9 @@ fn summarize_autoplay_benchmark(
     backend: PlannerBackend,
     suite: &BenchmarkSuite,
     records: Vec<AutoplayBenchmarkRecord>,
+    root_parallel_enabled: bool,
+    root_parallel_workers: usize,
+    root_parallel_worker_simulation_budget: Option<usize>,
 ) -> AutoplayBenchmarkResult {
     let games = records.len();
     let wins = records.iter().filter(|record| record.won).count();
@@ -235,6 +240,9 @@ fn summarize_autoplay_benchmark(
         root_parallel_step_count,
         average_root_parallel_workers,
         average_root_parallel_simulations,
+        root_parallel_enabled,
+        root_parallel_workers,
+        root_parallel_worker_simulation_budget,
         late_exact_trigger_count,
         leaf_eval_mode,
         vnet_model_path,
@@ -1095,6 +1103,54 @@ mod tests {
         let _ = export_autoplay_game_csv(&result);
 
         assert_eq!(result, before);
+    }
+
+    #[test]
+    fn autoplay_progress_reports_one_event_per_game_without_changing_results() {
+        let runner = ExperimentRunner;
+        let suite = BenchmarkSuite::from_base_seed("progress", 876, 2);
+        let config = fast_autoplay_benchmark_config("progress-config", PlannerBackend::BeliefUct);
+
+        let plain = runner.run_autoplay_benchmark(&suite, &config).unwrap();
+        let mut events = Vec::<ProgressEvent>::new();
+        let with_progress = runner
+            .run_autoplay_benchmark_with_progress(&suite, &config, &mut |event: &ProgressEvent| {
+                events.push(event.clone());
+            })
+            .unwrap();
+
+        assert_eq!(plain.records, with_progress.records);
+        assert_eq!(events.len(), 2);
+        assert!(events
+            .iter()
+            .all(|event| event.command == ProgressCommandKind::Autoplay));
+        assert_eq!(events[1].game_index, 2);
+        assert_eq!(events[1].game_total, 2);
+        assert_eq!(events[1].wins + events[1].losses, 2);
+    }
+
+    #[test]
+    fn root_parallel_override_updates_benchmark_config_summary_fields() {
+        let runner = ExperimentRunner;
+        let suite = BenchmarkSuite::from_base_seed("parallel-override", 877, 1);
+        let mut config =
+            fast_autoplay_benchmark_config("parallel-config", PlannerBackend::BeliefUct);
+        let override_config = crate::RootParallelConfigOverride {
+            enable_root_parallel: Some(true),
+            root_workers: Some(2),
+            worker_simulation_budget: Some(3),
+            worker_seed_stride: Some(17),
+        };
+        override_config
+            .apply_to_solver_config(&mut config.solver)
+            .unwrap();
+
+        let result = runner.run_autoplay_benchmark(&suite, &config).unwrap();
+
+        assert!(result.root_parallel_enabled);
+        assert_eq!(result.root_parallel_workers, 2);
+        assert_eq!(result.root_parallel_worker_simulation_budget, Some(3));
+        assert_eq!(config.solver.belief_planner.worker_seed_stride, 17);
     }
 
     #[test]

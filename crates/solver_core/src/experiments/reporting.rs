@@ -8,7 +8,7 @@ use super::{
     csv_table, optional_seed_string, termination_counts_string, to_pretty_json,
     AutoplayBenchmarkConfig, AutoplayBenchmarkResult, AutoplayComparisonResult,
     AutoplayRepeatedComparisonResult, AutoplayTerminationCount, BenchmarkResult, BenchmarkSuite,
-    BenchmarkSuiteDescription, ExperimentRunner, PlannerBackend,
+    BenchmarkSuiteDescription, ExperimentRunner, PlannerBackend, ProgressReporter,
 };
 /// Machine-friendly root-only benchmark summary report.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -82,6 +82,12 @@ pub struct AutoplayBenchmarkSummaryReport {
     pub avg_root_parallel_workers: f64,
     /// Average root-parallel worker simulations per game.
     pub avg_root_parallel_simulations: f64,
+    /// Whether root-parallel planner execution was enabled for this run.
+    pub root_parallel_enabled: bool,
+    /// Configured root worker count.
+    pub root_parallel_workers: usize,
+    /// Configured per-worker simulation budget, if explicitly set.
+    pub root_parallel_worker_simulation_budget: Option<usize>,
     /// Total late-exact triggers.
     pub late_exact_trigger_count: usize,
     /// Leaf evaluation mode configured for deterministic continuations.
@@ -242,6 +248,9 @@ impl AutoplayBenchmarkResult {
             root_parallel_step_count: self.root_parallel_step_count,
             avg_root_parallel_workers: self.average_root_parallel_workers,
             avg_root_parallel_simulations: self.average_root_parallel_simulations,
+            root_parallel_enabled: self.root_parallel_enabled,
+            root_parallel_workers: self.root_parallel_workers,
+            root_parallel_worker_simulation_budget: self.root_parallel_worker_simulation_budget,
             late_exact_trigger_count: self.late_exact_trigger_count,
             leaf_eval_mode: format!("{:?}", self.leaf_eval_mode),
             vnet_model_path: self.vnet_model_path.clone(),
@@ -278,6 +287,9 @@ impl AutoplayBenchmarkResult {
                 "root_parallel_step_count",
                 "avg_root_parallel_workers",
                 "avg_root_parallel_simulations",
+                "root_parallel_enabled",
+                "root_parallel_workers",
+                "root_parallel_worker_simulation_budget",
                 "late_exact_trigger_count",
                 "leaf_eval_mode",
                 "vnet_model_path",
@@ -304,6 +316,11 @@ impl AutoplayBenchmarkResult {
                 self.root_parallel_step_count.to_string(),
                 self.average_root_parallel_workers.to_string(),
                 self.average_root_parallel_simulations.to_string(),
+                self.root_parallel_enabled.to_string(),
+                self.root_parallel_workers.to_string(),
+                self.root_parallel_worker_simulation_budget
+                    .map(|budget| budget.to_string())
+                    .unwrap_or_default(),
                 self.late_exact_trigger_count.to_string(),
                 format!("{:?}", self.leaf_eval_mode),
                 self.vnet_model_path.clone().unwrap_or_default(),
@@ -521,6 +538,15 @@ pub fn run_autoplay_benchmark(
     ExperimentRunner.run_autoplay_benchmark(suite, config)
 }
 
+/// Runs one full-game autoplay benchmark and reports coarse progress.
+pub fn run_autoplay_benchmark_with_progress(
+    suite: &BenchmarkSuite,
+    config: &AutoplayBenchmarkConfig,
+    reporter: &mut impl ProgressReporter,
+) -> SolverResult<AutoplayBenchmarkResult> {
+    ExperimentRunner.run_autoplay_benchmark_with_progress(suite, config, reporter)
+}
+
 /// Runs one paired full-game autoplay comparison with the default experiment runner.
 pub fn run_autoplay_paired_comparison(
     suite: &BenchmarkSuite,
@@ -528,6 +554,17 @@ pub fn run_autoplay_paired_comparison(
     candidate: &AutoplayBenchmarkConfig,
 ) -> SolverResult<AutoplayComparisonResult> {
     ExperimentRunner.run_autoplay_paired_comparison(suite, baseline, candidate)
+}
+
+/// Runs one paired full-game autoplay comparison and reports coarse progress.
+pub fn run_autoplay_paired_comparison_with_progress(
+    suite: &BenchmarkSuite,
+    baseline: &AutoplayBenchmarkConfig,
+    candidate: &AutoplayBenchmarkConfig,
+    reporter: &mut impl ProgressReporter,
+) -> SolverResult<AutoplayComparisonResult> {
+    ExperimentRunner
+        .run_autoplay_paired_comparison_with_progress(suite, baseline, candidate, reporter)
 }
 
 /// Runs repeated paired full-game autoplay comparisons with deterministic suites.
@@ -546,6 +583,27 @@ pub fn run_autoplay_repeated_comparison(
         repetitions,
         baseline,
         candidate,
+    )
+}
+
+/// Runs repeated paired full-game autoplay comparisons with progress events.
+pub fn run_autoplay_repeated_comparison_with_progress(
+    suite_name: &str,
+    base_seed: u64,
+    suite_size: usize,
+    repetitions: usize,
+    baseline: &AutoplayBenchmarkConfig,
+    candidate: &AutoplayBenchmarkConfig,
+    reporter: &mut impl ProgressReporter,
+) -> SolverResult<AutoplayRepeatedComparisonResult> {
+    ExperimentRunner.run_autoplay_repeated_comparison_with_progress(
+        suite_name,
+        base_seed,
+        suite_size,
+        repetitions,
+        baseline,
+        candidate,
+        reporter,
     )
 }
 

@@ -66,6 +66,34 @@ fn reveal_state() -> FullState {
     )
 }
 
+fn safe_foundation_vs_shuffle_visible() -> VisibleState {
+    let mut visible = VisibleState::default();
+    visible.columns[0] = TableauColumn::new(0, vec![card("Ac")]);
+    visible.columns[1] = TableauColumn::new(0, vec![card("6h"), card("5s")]);
+    visible.columns[2] = TableauColumn::new(0, vec![card("6d")]);
+    visible
+}
+
+fn reveal_vs_shuffle_visible() -> VisibleState {
+    let mut visible = VisibleState::default();
+    visible
+        .foundations
+        .set_top_rank(Suit::Spades, Some(Rank::Jack));
+    visible.columns[0] = TableauColumn::new(1, vec![card("Qs")]);
+    visible.columns[1] = TableauColumn::new(0, vec![card("6h"), card("5s")]);
+    visible.columns[2] = TableauColumn::new(0, vec![card("6d")]);
+    visible
+}
+
+fn stock_vs_churn_visible() -> VisibleState {
+    let mut visible = VisibleState::default();
+    visible.columns[0] = TableauColumn::new(0, vec![card("6h"), card("5s")]);
+    visible.columns[1] = TableauColumn::new(0, vec![card("6d")]);
+    visible.stock =
+        CyclicStockState::from_parts(vec![card("7c"), card("8d"), card("9c")], 3, 0, 0, None, 3);
+    visible
+}
+
 fn closure_invocation_state() -> FullState {
     let mut visible = VisibleState::default();
     visible.foundations = complete_foundations();
@@ -189,6 +217,66 @@ fn move_ordering_is_deterministic_and_prioritizes_reveals() {
 
     assert_eq!(first, second);
     assert!(first[0].semantics.causes_reveal);
+}
+
+#[test]
+fn move_ordering_prioritizes_safe_ace_foundation_over_tableau_shuffle() {
+    let visible = safe_foundation_vs_shuffle_visible();
+    let ordered = ordered_macro_moves(&visible, DeterministicSearchConfig::default());
+
+    assert!(matches!(
+        ordered.first().map(|macro_move| macro_move.kind),
+        Some(MacroMoveKind::MoveTopToFoundation { src }) if src == col(0)
+    ));
+    assert!(strategic_move_score(&visible, &ordered[0]).safe_foundation_bonus > 0);
+}
+
+#[test]
+fn move_ordering_keeps_reveal_before_no_information_shuffle() {
+    let visible = reveal_vs_shuffle_visible();
+    let ordered = ordered_macro_moves(&visible, DeterministicSearchConfig::default());
+
+    assert!(ordered[0].semantics.causes_reveal);
+    let shuffle = ordered
+        .iter()
+        .find(|macro_move| {
+            matches!(
+                macro_move.atomic,
+                AtomicMove::TableauToTableau { src, dest, .. } if src == col(1) && dest == col(2)
+            )
+        })
+        .expect("state should include a tableau shuffle");
+    assert!(strategic_move_score(&visible, shuffle).churn_penalty < 0);
+}
+
+#[test]
+fn stock_access_orders_before_low_information_tableau_churn() {
+    let visible = stock_vs_churn_visible();
+    let ordered = ordered_macro_moves(&visible, DeterministicSearchConfig::default());
+
+    assert!(matches!(ordered[0].kind, MacroMoveKind::AdvanceStock));
+    let shuffle = ordered
+        .iter()
+        .find(|macro_move| matches!(macro_move.kind, MacroMoveKind::MoveRun { .. }))
+        .expect("state should include a tableau shuffle");
+    let stock_score = strategic_move_score(&visible, &ordered[0]);
+    let shuffle_score = strategic_move_score(&visible, shuffle);
+    assert!(stock_score.total > shuffle_score.total);
+    assert!(shuffle_score.churn_penalty < 0);
+}
+
+#[test]
+fn approximate_evaluation_values_reveal_potential_over_churn_only_shape() {
+    let reveal_visible = reveal_vs_shuffle_visible();
+    let mut churn_visible = VisibleState::default();
+    churn_visible.columns[0] = TableauColumn::new(0, vec![card("6h"), card("5s")]);
+    churn_visible.columns[1] = TableauColumn::new(0, vec![card("6d")]);
+    churn_visible.columns[2] = TableauColumn::new(1, Vec::new());
+
+    assert!(
+        evaluate_state(&reveal_visible, EvaluatorWeights::default())
+            > evaluate_state(&churn_visible, EvaluatorWeights::default())
+    );
 }
 
 #[test]

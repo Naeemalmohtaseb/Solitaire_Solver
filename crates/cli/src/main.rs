@@ -5,25 +5,27 @@ use std::{
     fs,
     io::{Error as IoError, ErrorKind},
     path::{Path, PathBuf},
+    time::{Duration, Instant},
 };
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
 
 use solver_core::{
-    collect_vnet_examples_from_autoplay_suite, compare_experiment_presets_on_suite,
+    collect_vnet_examples_from_autoplay_suite, compare_experiment_presets_on_suite_with_progress,
     compare_oracle_results, evaluate_oracle_cases, experiment_preset_by_name,
     load_oracle_case_pack, load_oracle_local_evaluation, load_oracle_reference_results,
     load_regression_pack, load_session, oracle_cases_from_seeded_suite, play_game_with_planner,
     regression_pack_from_benchmark_suite, regression_pack_from_session, replay_session,
-    run_autoplay_benchmark, run_autoplay_paired_comparison, run_autoplay_repeated_comparison,
-    run_regression_pack, save_oracle_case_pack, save_oracle_local_evaluation, save_regression_pack,
-    save_session, AutoplayBenchmarkResult, AutoplayComparisonResult,
-    AutoplayRepeatedComparisonResult, BenchmarkSuite, DatasetFormat, DealSeed,
-    DeterministicSearchConfig, ExperimentPreset, ExperimentRunner, LeafEvaluationMode,
+    run_autoplay_benchmark_with_progress, run_autoplay_paired_comparison_with_progress,
+    run_autoplay_repeated_comparison_with_progress, run_regression_pack, save_oracle_case_pack,
+    save_oracle_local_evaluation, save_regression_pack, save_session, AutoplayBenchmarkResult,
+    AutoplayComparisonResult, AutoplayRepeatedComparisonResult, BenchmarkSuite, DatasetFormat,
+    DealSeed, DeterministicSearchConfig, ExperimentPreset, ExperimentRunner, LeafEvaluationMode,
     OracleComparisonSummary, OracleEvaluationConfig, OracleEvaluationMode, PresetComparisonSummary,
-    PresetRankingMetric, RegressionPack, RegressionPackSummary, RegressionRunConfig,
-    RegressionRunResult, SessionMetadata, SessionRecord, SessionSummary, SolveBudget, VNetDataset,
-    VNetDatasetWriter, VNetExportConfig, VNetLabelMode, EXPERIMENT_PRESET_NAMES,
+    PresetRankingMetric, ProgressEvent, ProgressReporter, RegressionPack, RegressionPackSummary,
+    RegressionRunConfig, RegressionRunResult, RootParallelConfigOverride, SessionMetadata,
+    SessionRecord, SessionSummary, SolveBudget, VNetDataset, VNetDatasetWriter, VNetExportConfig,
+    VNetLabelMode, EXPERIMENT_PRESET_NAMES,
 };
 
 type CliResult<T> = Result<T, Box<dyn Error>>;
@@ -166,6 +168,34 @@ struct LeafEvalArgs {
     vnet_model: Option<PathBuf>,
 }
 
+/// Optional root-parallel planner overrides for benchmark commands.
+#[derive(Debug, Clone, Default, Args)]
+struct RootParallelArgs {
+    /// Enable independent root-parallel planner workers for this run.
+    #[arg(long = "root-parallel", conflicts_with = "no_root_parallel")]
+    root_parallel: bool,
+    /// Disable root-parallel planner workers even if the preset enables them.
+    #[arg(long = "no-root-parallel")]
+    no_root_parallel: bool,
+    /// Override the number of independent root workers.
+    #[arg(long = "root-workers")]
+    root_workers: Option<usize>,
+    /// Override the per-worker root simulation budget.
+    #[arg(long = "worker-sim-budget")]
+    worker_simulation_budget: Option<usize>,
+    /// Override the deterministic seed stride between root workers.
+    #[arg(long = "worker-seed-stride")]
+    worker_seed_stride: Option<u64>,
+}
+
+/// Optional CLI progress controls.
+#[derive(Debug, Clone, Default, Args)]
+struct ProgressArgs {
+    /// Suppress periodic progress lines.
+    #[arg(long = "no-progress")]
+    no_progress: bool,
+}
+
 /// Arguments for `benchmark autoplay`.
 #[derive(Debug, Clone, Args)]
 struct BenchmarkAutoplayArgs {
@@ -178,6 +208,10 @@ struct BenchmarkAutoplayArgs {
     export: ExportArgs,
     #[command(flatten)]
     leaf: LeafEvalArgs,
+    #[command(flatten)]
+    parallel: RootParallelArgs,
+    #[command(flatten)]
+    progress: ProgressArgs,
     /// Path for per-game CSV rows.
     #[arg(long = "game-csv")]
     game_csv: Option<PathBuf>,
@@ -208,6 +242,10 @@ struct BenchmarkCompareArgs {
     /// Candidate V-Net inference artifact path.
     #[arg(long = "candidate-vnet-model")]
     candidate_vnet_model: Option<PathBuf>,
+    #[command(flatten)]
+    parallel: RootParallelArgs,
+    #[command(flatten)]
+    progress: ProgressArgs,
 }
 
 /// Arguments for `benchmark repeated-compare`.
@@ -245,6 +283,10 @@ struct BenchmarkRepeatedCompareArgs {
     /// Candidate V-Net inference artifact path.
     #[arg(long = "candidate-vnet-model")]
     candidate_vnet_model: Option<PathBuf>,
+    #[command(flatten)]
+    parallel: RootParallelArgs,
+    #[command(flatten)]
+    progress: ProgressArgs,
 }
 
 /// Ranking metric accepted by `benchmark compare-presets`.
@@ -308,6 +350,10 @@ struct BenchmarkComparePresetsArgs {
     export: ExportArgs,
     #[command(flatten)]
     leaf: LeafEvalArgs,
+    #[command(flatten)]
+    parallel: RootParallelArgs,
+    #[command(flatten)]
+    progress: ProgressArgs,
 }
 
 /// Label modes accepted by `dataset export-vnet`.
@@ -837,13 +883,15 @@ fn run_autoplay_benchmark_command(
 ) -> CliResult<AutoplayBenchmarkResult> {
     let mut preset = lookup_preset(&args.preset)?;
     apply_leaf_eval_override(&mut preset, &args.leaf);
+    apply_root_parallel_override(&mut preset, &args.parallel)?;
     let suite = BenchmarkSuite::from_base_seed(
         format!("cli-autoplay-{}", preset.name),
         args.suite.seed,
         args.suite.games,
     );
     let config = benchmark_config_from_preset(preset, args.suite.max_steps);
-    let result = run_autoplay_benchmark(&suite, &config)?;
+    let mut progress = CliProgressReporter::from_args(&args.progress);
+    let result = run_autoplay_benchmark_with_progress(&suite, &config, &mut progress)?;
 
     write_optional(&args.export.json, result.to_json_summary()?)?;
     write_optional(&args.export.csv, result.to_csv_summary())?;
@@ -861,6 +909,7 @@ fn run_compare_command(args: &BenchmarkCompareArgs) -> CliResult<AutoplayCompari
             vnet_model: args.baseline_vnet_model.clone(),
         },
     );
+    apply_root_parallel_override(&mut baseline_preset, &args.parallel)?;
     let mut candidate_preset = lookup_preset(&args.candidate)?;
     apply_leaf_eval_override(
         &mut candidate_preset,
@@ -869,6 +918,7 @@ fn run_compare_command(args: &BenchmarkCompareArgs) -> CliResult<AutoplayCompari
             vnet_model: args.candidate_vnet_model.clone(),
         },
     );
+    apply_root_parallel_override(&mut candidate_preset, &args.parallel)?;
     let baseline = benchmark_config_from_preset(baseline_preset, args.suite.max_steps);
     let candidate = benchmark_config_from_preset(candidate_preset, args.suite.max_steps);
     let suite = BenchmarkSuite::from_base_seed(
@@ -879,7 +929,9 @@ fn run_compare_command(args: &BenchmarkCompareArgs) -> CliResult<AutoplayCompari
         args.suite.seed,
         args.suite.games,
     );
-    let result = run_autoplay_paired_comparison(&suite, &baseline, &candidate)?;
+    let mut progress = CliProgressReporter::from_args(&args.progress);
+    let result =
+        run_autoplay_paired_comparison_with_progress(&suite, &baseline, &candidate, &mut progress)?;
 
     write_optional(&args.export.json, result.to_json_summary()?)?;
     write_optional(&args.export.csv, result.to_csv_summary())?;
@@ -898,6 +950,7 @@ fn run_repeated_compare_command(
             vnet_model: args.baseline_vnet_model.clone(),
         },
     );
+    apply_root_parallel_override(&mut baseline_preset, &args.parallel)?;
     let mut candidate_preset = lookup_preset(&args.candidate)?;
     apply_leaf_eval_override(
         &mut candidate_preset,
@@ -906,15 +959,18 @@ fn run_repeated_compare_command(
             vnet_model: args.candidate_vnet_model.clone(),
         },
     );
+    apply_root_parallel_override(&mut candidate_preset, &args.parallel)?;
     let baseline = benchmark_config_from_preset(baseline_preset, args.max_steps);
     let candidate = benchmark_config_from_preset(candidate_preset, args.max_steps);
-    let result = run_autoplay_repeated_comparison(
+    let mut progress = CliProgressReporter::from_args(&args.progress);
+    let result = run_autoplay_repeated_comparison_with_progress(
         "cli-repeated",
         args.seed,
         args.games,
         args.repetitions,
         &baseline,
         &candidate,
+        &mut progress,
     )?;
 
     write_optional(&args.export.json, result.to_json_summary()?)?;
@@ -929,6 +985,7 @@ fn run_compare_presets_command(
     let mut presets = preset_list_from_arg(args.presets.as_deref())?;
     for preset in &mut presets {
         apply_compare_presets_leaf_eval_override(preset, &args.leaf);
+        apply_root_parallel_override(preset, &args.parallel)?;
     }
     if let Some(max_steps) = args.max_steps {
         for preset in &mut presets {
@@ -936,7 +993,13 @@ fn run_compare_presets_command(
         }
     }
     let suite = BenchmarkSuite::from_base_seed("cli-compare-presets", args.seed, args.games);
-    let result = compare_experiment_presets_on_suite(&suite, &presets, args.rank_by.into())?;
+    let mut progress = CliProgressReporter::from_args(&args.progress);
+    let result = compare_experiment_presets_on_suite_with_progress(
+        &suite,
+        &presets,
+        args.rank_by.into(),
+        &mut progress,
+    )?;
 
     write_optional(&args.export.json, result.to_json_summary()?)?;
     write_optional(&args.export.csv, result.to_csv_summary())?;
@@ -1014,6 +1077,111 @@ fn benchmark_config_from_preset(
     config
 }
 
+fn apply_root_parallel_override(
+    preset: &mut ExperimentPreset,
+    args: &RootParallelArgs,
+) -> CliResult<()> {
+    args.to_override()
+        .apply_to_solver_config(&mut preset.solver)?;
+    Ok(())
+}
+
+impl RootParallelArgs {
+    fn to_override(&self) -> RootParallelConfigOverride {
+        let controls_parallel = self.root_workers.is_some()
+            || self.worker_simulation_budget.is_some()
+            || self.worker_seed_stride.is_some();
+        RootParallelConfigOverride {
+            enable_root_parallel: if self.root_parallel {
+                Some(true)
+            } else if self.no_root_parallel {
+                Some(false)
+            } else if controls_parallel {
+                Some(true)
+            } else {
+                None
+            },
+            root_workers: self.root_workers,
+            worker_simulation_budget: self.worker_simulation_budget,
+            worker_seed_stride: self.worker_seed_stride,
+        }
+    }
+}
+
+struct CliProgressReporter {
+    enabled: bool,
+    last_print: Option<Instant>,
+    min_interval: Duration,
+}
+
+impl CliProgressReporter {
+    fn from_args(args: &ProgressArgs) -> Self {
+        Self {
+            enabled: !args.no_progress,
+            last_print: None,
+            min_interval: Duration::from_secs(1),
+        }
+    }
+}
+
+impl ProgressReporter for CliProgressReporter {
+    fn report(&mut self, event: &ProgressEvent) {
+        if !self.enabled {
+            return;
+        }
+        let now = Instant::now();
+        let is_final = event.game_index >= event.game_total;
+        let should_print = is_final
+            || self
+                .last_print
+                .map(|last| now.duration_since(last) >= self.min_interval)
+                .unwrap_or(true);
+        if !should_print {
+            return;
+        }
+        self.last_print = Some(now);
+        print_progress_event(event);
+    }
+}
+
+fn print_progress_event(event: &ProgressEvent) {
+    let preset = event.preset_name.as_deref().unwrap_or("n/a");
+    let backend = event
+        .backend
+        .map(|backend| format!("{backend:?}"))
+        .unwrap_or_else(|| "n/a".to_string());
+    let preset_part = match (event.preset_index, event.preset_total) {
+        (Some(index), Some(total)) => format!(" preset {index}/{total}"),
+        _ => String::new(),
+    };
+    let repetition_part = match (event.repetition_index, event.repetition_total) {
+        (Some(index), Some(total)) => format!(" rep {index}/{total}"),
+        _ => String::new(),
+    };
+    let eta = event
+        .eta_ms
+        .map(format_duration_ms)
+        .unwrap_or_else(|| "n/a".to_string());
+    println!(
+        "[progress {:?}{preset_part}{repetition_part}] {preset} ({backend}) game {}/{} wins/losses {}/{} elapsed {} eta {}",
+        event.command,
+        event.game_index,
+        event.game_total,
+        event.wins,
+        event.losses,
+        format_duration_ms(event.elapsed_ms),
+        eta
+    );
+}
+
+fn format_duration_ms(ms: u64) -> String {
+    if ms < 1_000 {
+        format!("{ms}ms")
+    } else {
+        format!("{:.1}s", ms as f64 / 1_000.0)
+    }
+}
+
 fn apply_leaf_eval_override(preset: &mut ExperimentPreset, args: &LeafEvalArgs) {
     if let Some(mode) = args.leaf_eval_mode {
         preset.solver.deterministic.leaf_eval_mode = mode.into();
@@ -1074,6 +1242,15 @@ fn print_autoplay_summary(result: &AutoplayBenchmarkResult) {
         result.root_parallel_step_count,
         result.average_root_parallel_workers,
         result.average_root_parallel_simulations
+    );
+    println!(
+        "  root-parallel config: enabled={} workers={} worker_sim_budget={}",
+        result.root_parallel_enabled,
+        result.root_parallel_workers,
+        result
+            .root_parallel_worker_simulation_budget
+            .map(|budget| budget.to_string())
+            .unwrap_or_else(|| "split".to_string())
     );
     println!(
         "  leaf: {:?}  vnet model: {}",
@@ -1338,6 +1515,12 @@ mod tests {
             "vnet",
             "--vnet-model",
             "best_vnet_inference.json",
+            "--root-parallel",
+            "--root-workers",
+            "2",
+            "--worker-sim-budget",
+            "4",
+            "--no-progress",
         ])
         .unwrap();
 
@@ -1356,6 +1539,10 @@ mod tests {
                     args.leaf.vnet_model,
                     Some(PathBuf::from("best_vnet_inference.json"))
                 );
+                assert!(args.parallel.root_parallel);
+                assert_eq!(args.parallel.root_workers, Some(2));
+                assert_eq!(args.parallel.worker_simulation_budget, Some(4));
+                assert!(args.progress.no_progress);
             }
             _ => panic!("wrong command parsed"),
         }
@@ -1381,6 +1568,8 @@ mod tests {
             "vnet",
             "--candidate-vnet-model",
             "best_vnet_inference.json",
+            "--root-workers",
+            "2",
         ])
         .unwrap();
         match compare.command {
@@ -1396,6 +1585,7 @@ mod tests {
                     args.candidate_vnet_model,
                     Some(PathBuf::from("best_vnet_inference.json"))
                 );
+                assert_eq!(args.parallel.root_workers, Some(2));
             }
             _ => panic!("wrong command parsed"),
         }
@@ -1448,6 +1638,8 @@ mod tests {
             "vnet",
             "--vnet-model",
             "best_vnet_inference.json",
+            "--worker-seed-stride",
+            "99",
         ])
         .unwrap();
 
@@ -1469,6 +1661,7 @@ mod tests {
                     args.leaf.vnet_model,
                     Some(PathBuf::from("best_vnet_inference.json"))
                 );
+                assert_eq!(args.parallel.worker_seed_stride, Some(99));
             }
             _ => panic!("wrong command parsed"),
         }
@@ -1767,6 +1960,8 @@ mod tests {
             },
             export: ExportArgs::default(),
             leaf: LeafEvalArgs::default(),
+            parallel: RootParallelArgs::default(),
+            progress: ProgressArgs { no_progress: true },
             game_csv: None,
         };
 
@@ -1779,6 +1974,35 @@ mod tests {
     }
 
     #[test]
+    fn root_parallel_cli_override_changes_used_config() {
+        let args = BenchmarkAutoplayArgs {
+            preset: "fast_benchmark".to_string(),
+            suite: SuiteArgs {
+                games: 1,
+                seed: 8,
+                max_steps: Some(0),
+            },
+            export: ExportArgs::default(),
+            leaf: LeafEvalArgs::default(),
+            parallel: RootParallelArgs {
+                root_parallel: true,
+                no_root_parallel: false,
+                root_workers: Some(2),
+                worker_simulation_budget: Some(3),
+                worker_seed_stride: Some(19),
+            },
+            progress: ProgressArgs { no_progress: true },
+            game_csv: None,
+        };
+
+        let result = run_autoplay_benchmark_command(&args).unwrap();
+
+        assert!(result.root_parallel_enabled);
+        assert_eq!(result.root_parallel_workers, 2);
+        assert_eq!(result.root_parallel_worker_simulation_budget, Some(3));
+    }
+
+    #[test]
     fn compare_presets_command_wiring_is_reproducible_on_small_suite() {
         let args = BenchmarkComparePresetsArgs {
             presets: Some("fast_benchmark,balanced_benchmark".to_string()),
@@ -1788,6 +2012,8 @@ mod tests {
             rank_by: CliRankingMetric::Efficiency,
             export: ExportArgs::default(),
             leaf: LeafEvalArgs::default(),
+            parallel: RootParallelArgs::default(),
+            progress: ProgressArgs { no_progress: true },
         };
 
         let first = run_compare_presets_command(&args).unwrap();
@@ -1811,6 +2037,8 @@ mod tests {
                 leaf_eval_mode: None,
                 vnet_model: Some(PathBuf::from("shared-vnet.json")),
             },
+            parallel: RootParallelArgs::default(),
+            progress: ProgressArgs { no_progress: true },
         };
 
         let result = run_compare_presets_command(&args).unwrap();

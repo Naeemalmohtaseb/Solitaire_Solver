@@ -37,6 +37,27 @@ priority-based replacement. Zobrist hashing and richer bound handling can
 replace the structural hash/interface later without changing planner-facing
 solver APIs.
 
+Move ordering and heuristic cutoff evaluation use a small explainable strategic
+score. This is not pruning. It only orders children and shapes approximate leaf
+values. The current principles are:
+
+- reveal-causing moves first because they reduce hidden information
+- clearly safe Ace/Two foundation moves very early
+- other foundation progress before noisy tableau rearrangement
+- stock/waste access improvements before low-information tableau churn
+- empty columns are useful when they create real King space or pair with reveal
+  progress
+- visible-run moves that only reshuffle tableau cards without reveal,
+  foundation, stock, or empty-column progress receive a conservative churn
+  penalty
+- foundation retreats stay legal, but are ordered late unless search proves
+  they matter
+
+The handcrafted fast evaluator mirrors those principles by valuing foundation
+progress, hidden-card reduction, reveal potential, safe foundation availability,
+productive mobility, stock access, and useful empty columns, while discounting
+fake mobility from reversible tableau shuffles.
+
 `LeafEvaluationMode::VNet` can replace the handcrafted cutoff evaluator with a
 loaded V-Net artifact for fast/bounded leaf values. This is deliberately
 approximate: exact/proof-oriented outcomes still require proven search results,

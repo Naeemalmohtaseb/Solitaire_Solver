@@ -1,5 +1,7 @@
 //! Seeded deal suites, benchmark records, comparisons, and runners.
 
+use std::time::Instant;
+
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -14,7 +16,8 @@ use crate::{
 use super::{
     generate_benchmark_deal, mean, play_game_with_planner, standard_error,
     summarize_autoplay_benchmark, summarize_benchmark, vnet_model_path_string, AutoplayConfig,
-    AutoplayTermination, PimcConfig, PlannerBackend,
+    AutoplayTermination, NoopProgressReporter, PimcConfig, PlannerBackend, ProgressCommandKind,
+    ProgressContext, ProgressEvent, ProgressReporter,
 };
 /// A reproducible suite of deals identified by seed.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -431,6 +434,12 @@ pub struct AutoplayBenchmarkResult {
     pub average_root_parallel_workers: f64,
     /// Average root-parallel worker simulations per game.
     pub average_root_parallel_simulations: f64,
+    /// Whether root-parallel planner execution was enabled in the benchmark config.
+    pub root_parallel_enabled: bool,
+    /// Configured root worker count for this benchmark.
+    pub root_parallel_workers: usize,
+    /// Configured per-worker simulation budget, if explicitly overridden.
+    pub root_parallel_worker_simulation_budget: Option<usize>,
     /// Total late-exact trigger count.
     pub late_exact_trigger_count: usize,
     /// Leaf evaluation mode configured for this run.
@@ -707,12 +716,48 @@ impl ExperimentRunner {
         suite: &BenchmarkSuite,
         config: &AutoplayBenchmarkConfig,
     ) -> SolverResult<AutoplayBenchmarkResult> {
+        let mut reporter = NoopProgressReporter;
+        self.run_autoplay_benchmark_with_context(
+            suite,
+            config,
+            ProgressContext::new(ProgressCommandKind::Autoplay),
+            &mut reporter,
+        )
+    }
+
+    /// Runs one full-game autoplay configuration and reports coarse progress.
+    pub fn run_autoplay_benchmark_with_progress(
+        &self,
+        suite: &BenchmarkSuite,
+        config: &AutoplayBenchmarkConfig,
+        reporter: &mut impl ProgressReporter,
+    ) -> SolverResult<AutoplayBenchmarkResult> {
+        self.run_autoplay_benchmark_with_context(
+            suite,
+            config,
+            ProgressContext::new(ProgressCommandKind::Autoplay),
+            reporter,
+        )
+    }
+
+    pub(crate) fn run_autoplay_benchmark_with_context(
+        &self,
+        suite: &BenchmarkSuite,
+        config: &AutoplayBenchmarkConfig,
+        progress_context: ProgressContext,
+        reporter: &mut impl ProgressReporter,
+    ) -> SolverResult<AutoplayBenchmarkResult> {
         let mut records = Vec::with_capacity(suite.seeds.len());
+        let started_at = Instant::now();
+        let mut wins = 0usize;
         for seed in &suite.seeds {
             let deal = self.generate_deal(*seed)?;
             let result =
                 play_game_with_planner(&deal.full_state, &config.solver, &config.autoplay)?;
             let moves_played = result.trace.len();
+            if result.won {
+                wins += 1;
+            }
             records.push(AutoplayBenchmarkRecord {
                 seed: *seed,
                 won: result.won,
@@ -736,12 +781,24 @@ impl ExperimentRunner {
                 vnet_fallbacks: result.vnet_fallbacks,
                 vnet_inference_elapsed_us: result.vnet_inference_elapsed_us,
             });
+            report_autoplay_progress(
+                reporter,
+                progress_context,
+                config,
+                records.len(),
+                suite.seeds.len(),
+                wins,
+                started_at,
+            );
         }
         Ok(summarize_autoplay_benchmark(
             config.label.clone(),
             config.autoplay.backend,
             suite,
             records,
+            config.solver.belief_planner.enable_root_parallel,
+            config.solver.belief_planner.root_workers,
+            config.solver.belief_planner.worker_simulation_budget,
         ))
     }
 
@@ -752,8 +809,45 @@ impl ExperimentRunner {
         baseline: &AutoplayBenchmarkConfig,
         candidate: &AutoplayBenchmarkConfig,
     ) -> SolverResult<AutoplayComparisonResult> {
-        let baseline_result = self.run_autoplay_benchmark(suite, baseline)?;
-        let candidate_result = self.run_autoplay_benchmark(suite, candidate)?;
+        let mut reporter = NoopProgressReporter;
+        self.run_autoplay_paired_comparison_with_context(
+            suite,
+            baseline,
+            candidate,
+            ProgressContext::new(ProgressCommandKind::Compare),
+            &mut reporter,
+        )
+    }
+
+    /// Runs full-game A/B configs and reports coarse progress.
+    pub fn run_autoplay_paired_comparison_with_progress(
+        &self,
+        suite: &BenchmarkSuite,
+        baseline: &AutoplayBenchmarkConfig,
+        candidate: &AutoplayBenchmarkConfig,
+        reporter: &mut impl ProgressReporter,
+    ) -> SolverResult<AutoplayComparisonResult> {
+        self.run_autoplay_paired_comparison_with_context(
+            suite,
+            baseline,
+            candidate,
+            ProgressContext::new(ProgressCommandKind::Compare),
+            reporter,
+        )
+    }
+
+    fn run_autoplay_paired_comparison_with_context(
+        &self,
+        suite: &BenchmarkSuite,
+        baseline: &AutoplayBenchmarkConfig,
+        candidate: &AutoplayBenchmarkConfig,
+        progress_context: ProgressContext,
+        reporter: &mut impl ProgressReporter,
+    ) -> SolverResult<AutoplayComparisonResult> {
+        let baseline_result =
+            self.run_autoplay_benchmark_with_context(suite, baseline, progress_context, reporter)?;
+        let candidate_result =
+            self.run_autoplay_benchmark_with_context(suite, candidate, progress_context, reporter)?;
         let mut paired_records = Vec::with_capacity(suite.seeds.len());
         let mut candidate_only_wins = 0usize;
         let mut baseline_only_wins = 0usize;
@@ -824,13 +918,43 @@ impl ExperimentRunner {
         baseline: &AutoplayBenchmarkConfig,
         candidate: &AutoplayBenchmarkConfig,
     ) -> SolverResult<AutoplayRepeatedComparisonResult> {
+        let mut reporter = NoopProgressReporter;
+        self.run_autoplay_repeated_comparison_with_progress(
+            suite_name,
+            base_seed,
+            suite_size,
+            repetitions,
+            baseline,
+            candidate,
+            &mut reporter,
+        )
+    }
+
+    /// Runs repeated paired full-game autoplay comparisons with progress events.
+    pub fn run_autoplay_repeated_comparison_with_progress(
+        &self,
+        suite_name: &str,
+        base_seed: u64,
+        suite_size: usize,
+        repetitions: usize,
+        baseline: &AutoplayBenchmarkConfig,
+        candidate: &AutoplayBenchmarkConfig,
+        reporter: &mut impl ProgressReporter,
+    ) -> SolverResult<AutoplayRepeatedComparisonResult> {
         let mut summaries = Vec::with_capacity(repetitions);
         for (repetition_index, suite) in
             BenchmarkSuite::repeated_from_base_seed(suite_name, base_seed, suite_size, repetitions)
                 .into_iter()
                 .enumerate()
         {
-            let comparison = self.run_autoplay_paired_comparison(&suite, baseline, candidate)?;
+            let comparison = self.run_autoplay_paired_comparison_with_context(
+                &suite,
+                baseline,
+                candidate,
+                ProgressContext::new(ProgressCommandKind::RepeatedCompare)
+                    .with_repetition(repetition_index + 1, repetitions),
+                reporter,
+            )?;
             summaries.push(AutoplayRepetitionSummary {
                 repetition_index,
                 suite,
@@ -853,4 +977,42 @@ impl ExperimentRunner {
             ci_upper,
         })
     }
+}
+
+fn report_autoplay_progress(
+    reporter: &mut impl ProgressReporter,
+    context: ProgressContext,
+    config: &AutoplayBenchmarkConfig,
+    completed_games: usize,
+    total_games: usize,
+    wins: usize,
+    started_at: Instant,
+) {
+    let elapsed_ms = duration_ms(started_at.elapsed());
+    let eta_ms = if completed_games == 0 {
+        None
+    } else {
+        let remaining_games = total_games.saturating_sub(completed_games) as u128;
+        Some(((elapsed_ms as u128 * remaining_games) / completed_games as u128) as u64)
+    };
+    let event = ProgressEvent {
+        command: context.command,
+        preset_name: Some(config.label.name.clone()),
+        backend: Some(config.autoplay.backend),
+        preset_index: context.preset_index,
+        preset_total: context.preset_total,
+        repetition_index: context.repetition_index,
+        repetition_total: context.repetition_total,
+        game_index: completed_games,
+        game_total: total_games,
+        elapsed_ms,
+        eta_ms,
+        wins,
+        losses: completed_games.saturating_sub(wins),
+    };
+    reporter.report(&event);
+}
+
+fn duration_ms(duration: std::time::Duration) -> u64 {
+    duration.as_millis().min(u128::from(u64::MAX)) as u64
 }

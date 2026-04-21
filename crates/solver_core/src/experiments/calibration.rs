@@ -13,6 +13,7 @@ use super::{
     csv_table, experiment_preset_by_name, optional_seed_string, to_pretty_json,
     AutoplayBenchmarkConfig, AutoplayBenchmarkResult, AutoplayComparisonResult, BenchmarkSuite,
     BenchmarkSuiteDescription, ExperimentPreset, ExperimentRunner, PlannerBackend,
+    ProgressCommandKind, ProgressContext, ProgressReporter,
 };
 
 /// Ranking metric used by preset comparison reports.
@@ -59,6 +60,12 @@ pub struct PresetComparisonEntry {
     pub average_root_visits: f64,
     /// Total late-exact triggers.
     pub late_exact_trigger_count: usize,
+    /// Whether root-parallel planner execution was enabled in this preset config.
+    pub root_parallel_enabled: bool,
+    /// Configured root worker count.
+    pub root_parallel_workers: usize,
+    /// Configured per-worker simulation budget, if explicitly set.
+    pub root_parallel_worker_simulation_budget: Option<usize>,
     /// Leaf evaluation mode actually configured for this preset.
     pub leaf_eval_mode: LeafEvaluationMode,
     /// V-Net model path or artifact id, if configured.
@@ -98,6 +105,9 @@ impl PresetComparisonEntry {
             average_deterministic_nodes: result.average_deterministic_nodes,
             average_root_visits: result.average_root_visits,
             late_exact_trigger_count: result.late_exact_trigger_count,
+            root_parallel_enabled: result.root_parallel_enabled,
+            root_parallel_workers: result.root_parallel_workers,
+            root_parallel_worker_simulation_budget: result.root_parallel_worker_simulation_budget,
             leaf_eval_mode: result.leaf_eval_mode,
             vnet_model_path: result.vnet_model_path.clone(),
             vnet_inferences: result.vnet_inferences,
@@ -149,6 +159,12 @@ impl PresetComparisonSummary {
                     entry.average_deterministic_nodes.to_string(),
                     entry.average_root_visits.to_string(),
                     entry.late_exact_trigger_count.to_string(),
+                    entry.root_parallel_enabled.to_string(),
+                    entry.root_parallel_workers.to_string(),
+                    entry
+                        .root_parallel_worker_simulation_budget
+                        .map(|budget| budget.to_string())
+                        .unwrap_or_default(),
                     format!("{:?}", entry.leaf_eval_mode),
                     entry.vnet_model_path.clone().unwrap_or_default(),
                     entry.vnet_inferences.to_string(),
@@ -177,6 +193,9 @@ impl PresetComparisonSummary {
                 "avg_deterministic_nodes",
                 "avg_root_visits",
                 "late_exact_trigger_count",
+                "root_parallel_enabled",
+                "root_parallel_workers",
+                "root_parallel_worker_simulation_budget",
                 "leaf_eval_mode",
                 "vnet_model_path",
                 "vnet_inferences",
@@ -223,6 +242,27 @@ pub fn compare_experiment_presets_on_suite(
         .map(ExperimentPreset::autoplay_benchmark_config)
         .collect::<Vec<_>>();
     compare_preset_configs_on_suite(suite, &configs, ranking_metric, &runner)
+}
+
+/// Compares benchmark presets on the same autoplay suite with progress events.
+pub fn compare_experiment_presets_on_suite_with_progress(
+    suite: &BenchmarkSuite,
+    presets: &[ExperimentPreset],
+    ranking_metric: PresetRankingMetric,
+    reporter: &mut impl ProgressReporter,
+) -> SolverResult<PresetComparisonSummary> {
+    let runner = ExperimentRunner;
+    let configs = presets
+        .iter()
+        .map(ExperimentPreset::autoplay_benchmark_config)
+        .collect::<Vec<_>>();
+    compare_preset_configs_on_suite_with_progress(
+        suite,
+        &configs,
+        ranking_metric,
+        &runner,
+        reporter,
+    )
 }
 
 /// Compares named benchmark presets on the same autoplay suite.
@@ -302,9 +342,32 @@ fn compare_preset_configs_on_suite(
     ranking_metric: PresetRankingMetric,
     runner: &ExperimentRunner,
 ) -> SolverResult<PresetComparisonSummary> {
+    let mut reporter = super::NoopProgressReporter;
+    compare_preset_configs_on_suite_with_progress(
+        suite,
+        configs,
+        ranking_metric,
+        runner,
+        &mut reporter,
+    )
+}
+
+fn compare_preset_configs_on_suite_with_progress(
+    suite: &BenchmarkSuite,
+    configs: &[AutoplayBenchmarkConfig],
+    ranking_metric: PresetRankingMetric,
+    runner: &ExperimentRunner,
+    reporter: &mut impl ProgressReporter,
+) -> SolverResult<PresetComparisonSummary> {
     let mut entries = Vec::with_capacity(configs.len());
-    for config in configs {
-        let result = runner.run_autoplay_benchmark(suite, config)?;
+    for (index, config) in configs.iter().enumerate() {
+        let result = runner.run_autoplay_benchmark_with_context(
+            suite,
+            config,
+            ProgressContext::new(ProgressCommandKind::ComparePresets)
+                .with_preset(index + 1, configs.len()),
+            reporter,
+        )?;
         entries.push(PresetComparisonEntry::from_result(&result));
     }
     assign_ranks(&mut entries);
